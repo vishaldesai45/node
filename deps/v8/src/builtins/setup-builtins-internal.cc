@@ -4,6 +4,7 @@
 
 #include <fstream>
 
+#include "src/builtins/builtins-effects-analyzer.h"
 #include "src/builtins/builtins-inl.h"
 #include "src/builtins/profile-data-reader.h"
 #include "src/codegen/assembler-inl.h"
@@ -43,6 +44,54 @@ BUILTIN_LIST_C(FORWARD_DECLARE)
 #undef FORWARD_DECLARE
 
 namespace {
+
+#if V8_ENABLE_GEARBOX
+class InstructionSetExtensionScope {
+ public:
+  InstructionSetExtensionScope() {
+#if DEBUG
+    old_features = CpuFeatures::SupportedFeatures();
+#else
+    unsigned old_features = CpuFeatures::SupportedFeatures();
+#endif
+    CpuFeatures::SetSupported(SSE4_1);
+    unsigned new_features = CpuFeatures::SupportedFeatures();
+    if (new_features != old_features) is_set = true;
+  }
+
+  ~InstructionSetExtensionScope() {
+    if (is_set) {
+      CpuFeatures::SetUnsupported(SSE4_1);
+      is_set = false;
+    }
+    DCHECK_EQ(CpuFeatures::SupportedFeatures(), old_features);
+  }
+
+ private:
+  bool is_set = false;
+#if DEBUG
+  unsigned old_features = 0;
+#endif
+};
+
+#endif  // V8_ENABLE_GEARBOX
+
+const ProfileDataFromFile* GetProfileForBuiltin(Builtin id, const char* name) {
+#if V8_ENABLE_GEARBOX
+  if (Builtins::IsGearboxPlaceholder(id)) {
+    // V8 didn't need to use any profile for placeholder, because the
+    // instruction stream of placeholder builtin is unused.
+    return nullptr;
+  } else if (Builtins::IsISXVariant(id) || Builtins::IsGenericVariant(id)) {
+    // both of ISX and generic have same IR in schedule pass and also same as
+    // the collected profile, so v8 could use the placeholder's builtin profile
+    // for both variants.
+    Builtin placeholder = Builtins::GetGearboxPlaceholderFromVariant(id);
+    return ProfileDataFromFile::TryRead(Builtins::name(placeholder));
+  } else
+#endif
+    return ProfileDataFromFile::TryRead(name);
+}
 
 using BuiltinCompilationScheduler =
     compiler::CodeAssembler::BuiltinCompilationScheduler;
@@ -235,7 +284,7 @@ void CompileJSLinkageCodeStubBuiltin(Isolate* isolate, Builtin builtin,
       compiler::Pipeline::NewJSLinkageCodeStubBuiltinCompilationJob(
           isolate, builtin, generator, installer,
           BuiltinAssemblerOptions(isolate, builtin), argc, name,
-          ProfileDataFromFile::TryRead(name), finalize_order));
+          GetProfileForBuiltin(builtin, name), finalize_order));
   scheduler.CompileCode(isolate, std::move(job));
 }
 
@@ -269,12 +318,18 @@ void CompileCSLinkageCodeStubBuiltin(Isolate* isolate, Builtin builtin,
                                      BuiltinCompilationScheduler& scheduler) {
   // TODO(nicohartmann): Remove this once `BuildWithTurboshaftAssemblerCS` has
   // an actual use.
+#if V8_ENABLE_GEARBOX
+  std::optional<InstructionSetExtensionScope> isx_scope;
+  if (Builtins::IsISXVariant(builtin)) {
+    isx_scope.emplace();
+  }
+#endif  // V8_ENABLE_GEARBOX
   USE(&BuildWithTurboshaftAssemblerCS);
   std::unique_ptr<TurbofanCompilationJob> job(
       compiler::Pipeline::NewCSLinkageCodeStubBuiltinCompilationJob(
           isolate, builtin, generator, installer,
           BuiltinAssemblerOptions(isolate, builtin), interface_descriptor, name,
-          ProfileDataFromFile::TryRead(name), finalize_order));
+          GetProfileForBuiltin(builtin, name), finalize_order));
   scheduler.CompileCode(isolate, std::move(job));
 }
 
@@ -293,7 +348,7 @@ void CompileBytecodeHandler(
       compiler::Pipeline::NewBytecodeHandlerCompilationJob(
           isolate, builtin, generator, installer,
           BuiltinAssemblerOptions(isolate, builtin), name,
-          ProfileDataFromFile::TryRead(name), finalize_order));
+          GetProfileForBuiltin(builtin, name), finalize_order));
   scheduler.CompileCode(isolate, std::move(job));
 }
 
@@ -373,9 +428,15 @@ void SetupIsolateDelegate::ReplacePlaceholders(Isolate* isolate) {
 }
 
 // static
-void SetupIsolateDelegate::SetupBuiltinsInternal(Isolate* isolate) {
+void SetupIsolateDelegate::SetupBuiltinsInternal(
+    Isolate* isolate, bool compute_builtins_effects) {
   Builtins* builtins = isolate->builtins();
   DCHECK(!builtins->initialized_);
+
+  BuiltinsEffectsAnalyzer* builtins_effects_analyzer = nullptr;
+  if (compute_builtins_effects) {
+    builtins_effects_analyzer = BuiltinsEffectsAnalyzer::Setup(isolate);
+  }
 
   if (v8_flags.dump_builtins_hashes_to_file) {
     // Create an empty file.
@@ -488,6 +549,11 @@ void SetupIsolateDelegate::SetupBuiltinsInternal(Isolate* isolate) {
   scheduler.AwaitAndFinalizeCurrentBatch(isolate);
   CHECK_EQ(Builtins::kBuiltinCount, builtins_built_without_job_count +
                                         scheduler.builtins_installed_count());
+
+  if (compute_builtins_effects) {
+    DCHECK_NOT_NULL(builtins_effects_analyzer);
+    builtins_effects_analyzer->Finalize();
+  }
 
   // Add the generated builtins to the isolate.
   for (Builtin builtin = Builtins::kFirst; builtin <= Builtins::kLast;

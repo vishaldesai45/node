@@ -143,7 +143,7 @@ class SemiSpace final : public Space {
 
   void AddRangeToActiveSystemPages(Address start, Address end);
 
-  void MoveQuarantinedPage(MemoryChunk* chunk);
+  void MoveQuarantinedPage(PageMetadata* metadata);
 
  private:
   bool AllocateFreshPage();
@@ -209,6 +209,10 @@ class NewSpace : NON_EXPORTED_BASE(public SpaceWithLinearArea) {
     return result;
   }
 
+  // Promotes a young generation page to the old generation.
+  //
+  // Does not clear `will_be_promoted()` to allow for different collector
+  // handling.
   void PromotePageToOldSpace(PageMetadata* page, FreeMode free_mode);
 
   virtual size_t Capacity() const = 0;
@@ -422,7 +426,7 @@ class V8_EXPORT_PRIVATE SemiSpaceNewSpace final : public NewSpace {
   int GetSpaceRemainingOnCurrentPageForTesting();
   void FillCurrentPageForTesting();
 
-  void MoveQuarantinedPage(MemoryChunk* chunk);
+  void MoveQuarantinedPage(PageMetadata* metadata);
   size_t QuarantinedSize() const { return quarantined_size_; }
   size_t QuarantinedPageCount() const {
     return to_space_.quarantined_pages_count_;
@@ -544,7 +548,7 @@ class V8_EXPORT_PRIVATE PagedSpaceForNewSpace final : public PagedSpaceBase {
 
   size_t AddPage(PageMetadata* page) final;
   void RemovePage(PageMetadata* page) final;
-  void ReleasePage(PageMetadata* page) final;
+  void RemovePageFromSpace(PageMetadata* page) final;
 
   size_t ExternalBackingStoreBytes(ExternalBackingStoreType type) const final {
     if (type == ExternalBackingStoreType::kArrayBuffer)
@@ -726,7 +730,6 @@ class V8_EXPORT_PRIVATE PagedNewSpace final : public NewSpace {
   bool ShouldReleaseEmptyPage() {
     return paged_space_.ShouldReleaseEmptyPage();
   }
-  void ReleasePage(PageMetadata* page) { paged_space_.ReleasePage(page); }
 
   AllocatorPolicy* CreateAllocatorPolicy(MainAllocator* allocator) final;
 

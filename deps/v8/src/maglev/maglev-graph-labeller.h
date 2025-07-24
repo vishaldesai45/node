@@ -7,7 +7,6 @@
 
 #include <map>
 
-#include "src/maglev/maglev-graph.h"
 #include "src/maglev/maglev-ir.h"
 #include "src/utils/utils.h"
 
@@ -35,6 +34,10 @@ class MaglevGraphLabeller {
             .second) {
       next_node_label_++;
     }
+  }
+  void RegisterNode(const NodeBase* node, const Provenance* provenance) {
+    RegisterNode(node, provenance->unit, provenance->bytecode_offset,
+                 provenance->position);
   }
   void RegisterNode(const NodeBase* node) {
     RegisterNode(node, nullptr, BytecodeOffset::None(),
@@ -78,6 +81,69 @@ class MaglevGraphLabeller {
   std::map<const NodeBase*, NodeInfo> nodes_;
   int next_node_label_ = 1;
 };
+
+class MaglevGraphLabellerScope {
+ public:
+  explicit MaglevGraphLabellerScope(MaglevGraphLabeller* graph_labeller);
+  ~MaglevGraphLabellerScope();
+};
+
+extern thread_local MaglevGraphLabeller* thread_graph_labeller;
+
+MaglevGraphLabeller* GetCurrentGraphLabeller();
+
+#ifdef V8_ENABLE_MAGLEV_GRAPH_PRINTER
+
+class PrintNode {
+ public:
+  explicit PrintNode(const NodeBase* node, bool skip_targets = false)
+      : node_(node), skip_targets_(skip_targets) {}
+
+  void Print(std::ostream& os) const;
+
+ private:
+  const NodeBase* node_;
+  // This is used when tracing graph building, since targets might not exist
+  // yet.
+  const bool skip_targets_;
+};
+
+class PrintNodeLabel {
+ public:
+  explicit PrintNodeLabel(const NodeBase* node) : node_(node) {}
+
+  void Print(std::ostream& os) const;
+
+ private:
+  const NodeBase* node_;
+};
+
+#else
+
+class PrintNode {
+ public:
+  explicit PrintNode(const NodeBase* node, bool skip_targets = false) {}
+  void Print(std::ostream& os) const {}
+};
+
+class PrintNodeLabel {
+ public:
+  explicit PrintNodeLabel(const NodeBase* node) {}
+  void Print(std::ostream& os) const {}
+};
+
+#endif  // V8_ENABLE_MAGLEV_GRAPH_PRINTER
+
+inline std::ostream& operator<<(std::ostream& os, const PrintNode& printer) {
+  printer.Print(os);
+  return os;
+}
+
+inline std::ostream& operator<<(std::ostream& os,
+                                const PrintNodeLabel& printer) {
+  printer.Print(os);
+  return os;
+}
 
 }  // namespace maglev
 }  // namespace internal

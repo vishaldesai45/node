@@ -62,7 +62,7 @@ Handle<SharedFunctionInfo> FunctionTemplateInfo::GetOrCreateSharedFunctionInfo(
 bool FunctionTemplateInfo::IsTemplateFor(Tagged<Map> map) const {
   RCS_SCOPE(
       LocalHeap::Current() == nullptr
-          ? GetIsolateChecked()->counters()->runtime_call_stats()
+          ? Isolate::Current()->counters()->runtime_call_stats()
           : LocalIsolate::FromHeap(LocalHeap::Current())->runtime_call_stats(),
       RuntimeCallCounterId::kIsTemplateFor);
 
@@ -247,7 +247,7 @@ DirectHandle<JSObject> DictionaryTemplateInfo::NewInstance(
     DirectHandle<NativeContext> context,
     DirectHandle<DictionaryTemplateInfo> self,
     const MemorySpan<MaybeLocal<Value>>& property_values) {
-  Isolate* isolate = context->GetIsolate();
+  Isolate* isolate = Isolate::Current();
   DirectHandle<FixedArray> property_names(self->property_names(), isolate);
 
   const int property_names_len = property_names->length();

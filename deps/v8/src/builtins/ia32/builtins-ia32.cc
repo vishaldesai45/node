@@ -467,6 +467,10 @@ static void Generate_JSEntryTrampolineHelper(MacroAssembler* masm,
     ExternalReference context_address = ExternalReference::Create(
         IsolateAddressId::kContextAddress, masm->isolate());
     __ mov(esi, __ ExternalReferenceAsOperand(context_address, scratch1));
+#ifdef DEBUG
+    __ mov(__ ExternalReferenceAsOperand(context_address, scratch1),
+           Immediate(Context::kNoContext));
+#endif  // DEBUG
 
     // Load the previous frame pointer (edx) to access C arguments
     __ mov(scratch1, Operand(ebp, 0));
@@ -542,8 +546,7 @@ static void GetSharedFunctionInfoBytecode(MacroAssembler* masm,
 
   __ CmpObjectType(sfi_data, INTERPRETER_DATA_TYPE, scratch1);
   __ j(not_equal, &done, Label::kNear);
-  __ mov(sfi_data,
-         FieldOperand(sfi_data, InterpreterData::kBytecodeArrayOffset));
+  __ LoadInterpreterDataBytecodeArray(sfi_data, sfi_data);
 
   __ bind(&done);
 }
@@ -588,7 +591,7 @@ static void GetSharedFunctionInfoBytecodeOrBaseline(
 
   __ CmpInstanceType(scratch1, INTERPRETER_DATA_TYPE);
   __ j(not_equal, is_unavailable);
-  __ mov(data, FieldOperand(data, InterpreterData::kBytecodeArrayOffset));
+  __ LoadInterpreterDataBytecodeArray(data, data);
 
   __ bind(&done);
 }
@@ -1734,8 +1737,7 @@ static void Generate_InterpreterEnterBytecode(MacroAssembler* masm) {
   __ CmpObjectType(scratch, INTERPRETER_DATA_TYPE, eax);
   __ j(not_equal, &builtin_trampoline, Label::kNear);
 
-  __ mov(scratch,
-         FieldOperand(scratch, InterpreterData::kInterpreterTrampolineOffset));
+  __ LoadInterpreterDataInterpreterTrampoline(scratch, scratch);
   __ LoadCodeInstructionStart(scratch, scratch);
   __ jmp(&trampoline_loaded, Label::kNear);
 
@@ -3333,19 +3335,25 @@ void LoadTargetJumpBuffer(MacroAssembler* masm, Register target_stack,
 }
 
 // Updates the stack limit and central stack info, and validates the switch.
-void SwitchStacks(MacroAssembler* masm, Register old_stack, bool return_switch,
+void SwitchStacks(MacroAssembler* masm, ExternalReference fn,
+                  Register old_stack, Register maybe_suspender,
                   const std::initializer_list<Register> keep) {
-  using ER = ExternalReference;
   for (auto reg : keep) {
     __ Push(reg);
   }
-  FrameScope scope(masm, StackFrame::MANUAL);
-  __ PrepareCallCFunction(2, eax);
-  __ Move(Operand(esp, 0 * kSystemPointerSize),
-          Immediate(ER::isolate_address(masm->isolate())));
-  __ mov(Operand(esp, 1 * kSystemPointerSize), old_stack);
-  __ CallCFunction(
-      return_switch ? ER::wasm_return_switch() : ER::wasm_switch_stacks(), 2);
+  {
+    FrameScope scope(masm, StackFrame::MANUAL);
+    int num_args = maybe_suspender.is_valid() ? 3 : 2;
+    DCHECK(!AreAliased(eax, old_stack, maybe_suspender));
+    __ PrepareCallCFunction(num_args, eax);
+    __ Move(Operand(esp, 0 * kSystemPointerSize),
+            Immediate(ExternalReference::isolate_address()));
+    __ mov(Operand(esp, 1 * kSystemPointerSize), old_stack);
+    if (maybe_suspender.is_valid()) {
+      __ mov(Operand(esp, 2 * kSystemPointerSize), maybe_suspender);
+    }
+    __ CallCFunction(fn, num_args);
+  }
   for (auto it = std::rbegin(keep); it != std::rend(keep); ++it) {
     __ Pop(*it);
   }
@@ -3374,8 +3382,8 @@ void ReloadParentStack(MacroAssembler* masm, Register promise,
 
   __ Pop(promise);
   // Switch stack!
-  SwitchStacks(masm, active_stack, true,
-               {promise, return_value, context, parent});
+  SwitchStacks(masm, ExternalReference::wasm_return_stack(), active_stack,
+               no_reg, {promise, return_value, context, parent});
   LoadJumpBuffer(masm, parent, false, wasm::JumpBuffer::Inactive);
 }
 
@@ -3398,11 +3406,10 @@ void GetContextFromImplicitArg(MacroAssembler* masm, Register data,
 
 void RestoreParentSuspender(MacroAssembler* masm, Register tmp1) {
   Register suspender = tmp1;
-  __ LoadRoot(suspender, RootIndex::kActiveSuspender);
+  __ LoadRootRelative(suspender, IsolateData::active_suspender_offset());
   __ Move(suspender,
           FieldOperand(suspender, WasmSuspenderObject::kParentOffset));
-  __ CompareRoot(suspender, RootIndex::kUndefinedValue);
-  __ mov(masm->RootAsOperand(RootIndex::kActiveSuspender), suspender);
+  __ StoreRootRelative(IsolateData::active_suspender_offset(), suspender);
 }
 
 void ResetStackSwitchFrameStackSlots(MacroAssembler* masm) {
@@ -3421,7 +3428,8 @@ void SwitchToAllocatedStack(MacroAssembler* masm, Register wrapper_buffer,
   __ LoadRootRelative(parent_stack, IsolateData::active_stack_offset());
   __ Move(parent_stack, Operand(parent_stack, wasm::kStackParentOffset));
   FillJumpBuffer(masm, parent_stack, scratch, suspend);
-  SwitchStacks(masm, parent_stack, false, {wrapper_buffer});
+  SwitchStacks(masm, ExternalReference::wasm_start_or_suspend_stack(),
+               parent_stack, no_reg, {wrapper_buffer});
   parent_stack = no_reg;
   Register target_stack = scratch;
   __ LoadRootRelative(target_stack, IsolateData::active_stack_offset());
@@ -3497,7 +3505,7 @@ void SwitchBackAndReturnPromise(MacroAssembler* masm, Register tmp,
 
   if (mode == wasm::kPromise) {
     __ mov(return_value, kReturnRegister0);
-    __ LoadRoot(promise, RootIndex::kActiveSuspender);
+    __ LoadRootRelative(promise, IsolateData::active_suspender_offset());
     __ Move(promise,
             FieldOperand(promise, WasmSuspenderObject::kPromiseOffset));
   }
@@ -3526,14 +3534,6 @@ void GenerateExceptionHandlingLandingPad(MacroAssembler* masm,
   // Restore esp to free the reserved stack slots for the sections.
   __ lea(esp, MemOperand(ebp, StackSwitchFrameConstants::kLastSpillOffset));
 
-  // Unset thread_in_wasm_flag.
-  Register thread_in_wasm_flag_addr = ecx;
-  __ mov(
-      thread_in_wasm_flag_addr,
-      MemOperand(kRootRegister, Isolate::thread_in_wasm_flag_address_offset()));
-  __ mov(MemOperand(thread_in_wasm_flag_addr, 0), Immediate(0));
-  thread_in_wasm_flag_addr = no_reg;
-
   // The exception becomes the parameter of the RejectPromise builtin, and the
   // promise is the return value of this wrapper.
   static const Builtin_RejectPromise_InterfaceDescriptor desc;
@@ -3543,7 +3543,7 @@ void GenerateExceptionHandlingLandingPad(MacroAssembler* masm,
 
   __ mov(reason, kReturnRegister0);
 
-  __ LoadRoot(promise, RootIndex::kActiveSuspender);
+  __ LoadRootRelative(promise, IsolateData::active_suspender_offset());
   __ Move(promise, FieldOperand(promise, WasmSuspenderObject::kPromiseOffset));
 
   __ mov(kContextRegister,
@@ -3674,15 +3674,6 @@ void JSToWasmWrapperHelper(MacroAssembler* masm, wasm::Promise mode) {
     __ Movsd(wasm::kFpParamRegisters[i], MemOperand(params_start, next_offset));
   }
 
-  // Set the flag-in-wasm flag before loading the parameter registers. There are
-  // not so many registers, so we use one of the parameter registers before it
-  // is blocked.
-  Register thread_in_wasm_flag_addr = ecx;
-  __ mov(
-      thread_in_wasm_flag_addr,
-      MemOperand(kRootRegister, Isolate::thread_in_wasm_flag_address_offset()));
-  __ mov(MemOperand(thread_in_wasm_flag_addr, 0), Immediate(1));
-
   next_offset -= param_padding;
   for (size_t i = arraysize(wasm::kGpParamRegisters) - 1; i > 0; --i) {
     next_offset -= kSystemPointerSize;
@@ -3711,12 +3702,6 @@ void JSToWasmWrapperHelper(MacroAssembler* masm, wasm::Promise mode) {
             Immediate(0));
   }
   __ CallWasmCodePointer(call_target);
-
-  __ mov(
-      thread_in_wasm_flag_addr,
-      MemOperand(kRootRegister, Isolate::thread_in_wasm_flag_address_offset()));
-  __ mov(MemOperand(thread_in_wasm_flag_addr, 0), Immediate(0));
-  thread_in_wasm_flag_addr = no_reg;
 
   wrapper_buffer = esi;
   __ mov(wrapper_buffer,
@@ -3870,13 +3855,14 @@ void Builtins::Generate_WasmSuspend(MacroAssembler* masm) {
   __ StoreRootRelative(IsolateData::active_stack_offset(), caller);
   Register parent = edi;
   __ Move(parent, FieldOperand(suspender, WasmSuspenderObject::kParentOffset));
-  __ mov(masm->RootAsOperand(RootIndex::kActiveSuspender), parent);
+  __ StoreRootRelative(IsolateData::active_suspender_offset(), parent);
   parent = no_reg;
 
   // -------------------------------------------
   // Load jump buffer.
   // -------------------------------------------
-  SwitchStacks(masm, stack, false, {caller, suspender});
+  SwitchStacks(masm, ExternalReference::wasm_start_or_suspend_stack(), stack,
+               no_reg, {caller, suspender});
   __ Move(kReturnRegister0,
           FieldOperand(suspender, WasmSuspenderObject::kPromiseOffset));
   MemOperand GCScanSlotPlace =
@@ -3920,7 +3906,7 @@ void Generate_WasmResumeHelper(MacroAssembler* masm, wasm::OnResume on_resume) {
   // barrier is on the suspender, so load it in edi directly.
   Register suspender = edi;
   __ Move(suspender,
-          FieldOperand(function_data, WasmResumeData::kSuspenderOffset));
+          FieldOperand(function_data, WasmResumeData::kTrustedSuspenderOffset));
   closure = no_reg;
   sfi = no_reg;
 
@@ -3929,38 +3915,22 @@ void Generate_WasmResumeHelper(MacroAssembler* masm, wasm::OnResume on_resume) {
   // -------------------------------------------
 
   Label suspend;
-  Register active_stack = eax;
+  Register active_stack = ecx;
   __ LoadRootRelative(active_stack, IsolateData::active_stack_offset());
   FillJumpBuffer(masm, active_stack, edx, &suspend);
   SwitchStackState(masm, active_stack, wasm::JumpBuffer::Active,
                    wasm::JumpBuffer::Inactive);
-  active_stack = no_reg;
 
   // -------------------------------------------
-  // Set the suspender and continuation parents and update the roots.
+  // Call the C function.
   // -------------------------------------------
-  Register active_suspender = edx;
-  Register slot_address = WriteBarrierDescriptor::SlotAddressRegister();
-  // Check that the fixed register isn't one that is already in use.
-  DCHECK(!AreAliased(slot_address, suspender, active_suspender));
-
-  __ LoadRoot(active_suspender, RootIndex::kActiveSuspender);
-  __ mov(FieldOperand(suspender, WasmSuspenderObject::kParentOffset),
-         active_suspender);
-  __ RecordWriteField(suspender, WasmSuspenderObject::kParentOffset,
-                      active_suspender, slot_address, SaveFPRegsMode::kIgnore);
-  __ mov(masm->RootAsOperand(RootIndex::kActiveSuspender), suspender);
-
-  active_suspender = no_reg;
-
-  Register target_stack = suspender;
+  Register target_stack = edx;
   __ Move(target_stack,
           FieldOperand(suspender, WasmSuspenderObject::kStackOffset));
-  suspender = no_reg;
-  active_stack = edx;
-  __ LoadRootRelative(active_stack, IsolateData::active_stack_offset());
   __ StoreRootRelative(IsolateData::active_stack_offset(), target_stack);
-  SwitchStacks(masm, active_stack, false, {target_stack});
+  SwitchStacks(masm, ExternalReference::wasm_resume_stack(), active_stack,
+               suspender, {target_stack});
+  suspender = no_reg;
 
   // -------------------------------------------
   // Load state from target jmpbuf (longjmp).
@@ -5287,6 +5257,52 @@ void Builtins::Generate_DeoptimizationEntry_Eager(MacroAssembler* masm) {
 
 void Builtins::Generate_DeoptimizationEntry_Lazy(MacroAssembler* masm) {
   Generate_DeoptimizationEntry(masm, DeoptimizeKind::kLazy);
+}
+
+void Builtins::Generate_DeoptimizationEntry_LazyAfterFastCall(
+    MacroAssembler* masm) {
+  // The deoptimizer may have been triggered right after the return of a fast
+  // API call. In that case, exception handling and possible stack unwinding
+  // did not happen yet.
+  // We check here if a there is a pending exception by comparing the
+  // exception stored in the isolate with the no-exception sentinel
+  // (the_hole_value). If there is an exception, we call PropagateException to
+  // trigger stack unwinding.
+
+  Label no_exception;
+  __ mov(eax, __ ExternalReferenceAsOperand(
+                  ExternalReference::Create(IsolateAddressId::kExceptionAddress,
+                                            __ isolate()),
+                  eax));
+  __ CompareRoot(eax, RootIndex::kTheHoleValue);
+  __ j(equal, &no_exception);
+
+  __ EnterFrame(StackFrame::INTERNAL);
+  const RegList kCalleeSaveRegisters = {C_CALL_CALLEE_SAVE_REGISTERS};
+  __ MaybeSaveRegisters(kCalleeSaveRegisters);
+  __ Move(kContextRegister, Context::kNoContext);
+  // We have to reset IsolateData::fast_c_call_caller_fp(), because otherwise
+  // the  stack unwinder thinks that we are still within the fast C call.
+  if (v8_flags.debug_code) {
+    __ mov(eax,
+           __ ExternalReferenceAsOperand(IsolateFieldId::kFastCCallCallerFP));
+    __ test(eax, eax);
+    __ Assert(not_equal, AbortReason::kFastCallFallbackInvalid);
+  }
+  __ mov(__ ExternalReferenceAsOperand(IsolateFieldId::kFastCCallCallerFP),
+         Immediate(0));
+  __ CallRuntime(Runtime::FunctionId::kPropagateException);
+  __ MaybeRestoreRegisters(kCalleeSaveRegisters);
+  __ LeaveFrame(StackFrame::INTERNAL);
+
+  __ bind(&no_exception);
+  // Deoptimization expects that the return value of the API call is in the
+  // return register. As we only allow deoptimization if the return type is
+  // void, the return value is always `undefined`.
+  // TODO(crbug.com/418936518): Handle the return value in an actual
+  // deoptimization continuation.
+  __ LoadRoot(kReturnRegister0, RootIndex::kUndefinedValue);
+  __ TailCallBuiltin(Builtin::kDeoptimizationEntry_Lazy);
 }
 
 // If there is baseline code on the shared function info, converts an

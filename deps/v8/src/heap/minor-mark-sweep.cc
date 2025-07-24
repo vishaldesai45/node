@@ -295,7 +295,8 @@ void MinorMarkSweepCollector::PerformWrapperTracing() {
 
   TRACE_GC(heap_->tracer(), GCTracer::Scope::MINOR_MS_MARK_EMBEDDER_TRACING);
   local_marking_worklists()->PublishCppHeapObjects();
-  cpp_heap->AdvanceMarking(v8::base::TimeDelta::Max(), SIZE_MAX);
+  cpp_heap->AdvanceMarking(v8::base::TimeDelta::Max(), SIZE_MAX,
+                           StackState::kMayContainHeapPointers);
 }
 
 MinorMarkSweepCollector::~MinorMarkSweepCollector() = default;
@@ -696,7 +697,8 @@ void MinorMarkSweepCollector::MarkRootsFromConservativeStack(
 
   MinorMSConservativeStackVisitor stack_visitor(heap_->isolate(), root_visitor);
 
-  heap_->IterateConservativeStackRoots(&stack_visitor);
+  heap_->IterateConservativeStackRoots(&stack_visitor,
+                                       Heap::StackScanMode::kFull);
 }
 
 void MinorMarkSweepCollector::MarkLiveObjects() {
@@ -832,8 +834,8 @@ void MinorMarkSweepCollector::TraceFragmentation() {
           free_bytes_index++;
         }
       }
-      live_bytes += size;
-      free_start = free_end + size;
+      live_bytes += size.value();
+      free_start = free_end + size.value();
     }
     const Address top = heap_->NewSpaceTop();
     size_t area_end = p->Contains(top) ? top : p->area_end();
@@ -894,7 +896,7 @@ bool ShouldMovePage(PageMetadata* p, intptr_t live_bytes,
     // Don't allocate on old pages so that recently allocated objects on the
     // page get a chance to die young. The page will be force promoted on the
     // next GC because `AllocatedLabSize` will be 0.
-    p->Chunk()->SetFlagNonExecutable(MemoryChunk::NEVER_ALLOCATE_ON_PAGE);
+    p->SetFlagNonExecutable(MemoryChunk::NEVER_ALLOCATE_ON_PAGE);
   }
   return should_move_page;
 }
@@ -944,7 +946,8 @@ bool MinorMarkSweepCollector::StartSweepNewSpace() {
     intptr_t live_bytes_on_page = p->live_bytes();
     if (live_bytes_on_page == 0) {
       if (paged_space->ShouldReleaseEmptyPage()) {
-        paged_space->ReleasePage(p);
+        paged_space->RemovePageFromSpace(p);
+        heap_->memory_allocator()->Free(MemoryAllocator::FreeMode::kPool, p);
       } else {
         sweeper()->SweepEmptyNewSpacePage(p);
       }
@@ -955,8 +958,10 @@ bool MinorMarkSweepCollector::StartSweepNewSpace() {
       EvacuateExternalPointerReferences(p);
       // free list categories will be relinked by the sweeper after sweeping is
       // done.
+      p->set_will_be_promoted(true);
       heap_->new_space()->PromotePageToOldSpace(p,
                                                 FreeMode::kDoNotLinkCategory);
+      p->set_will_be_promoted(false);
       has_promoted_pages = true;
       sweeper()->AddPromotedPage(p);
     } else {
@@ -1035,7 +1040,6 @@ bool MinorMarkSweepCollector::SweepNewLargeSpace() {
 
   for (auto it = new_lo_space->begin(); it != new_lo_space->end();) {
     LargePageMetadata* current = *it;
-    MemoryChunk* chunk = current->Chunk();
     it++;
 
     Tagged<HeapObject> object = current->GetObject();
@@ -1046,8 +1050,8 @@ bool MinorMarkSweepCollector::SweepNewLargeSpace() {
                                       current);
       continue;
     }
-    chunk->ClearFlagNonExecutable(MemoryChunk::TO_PAGE);
-    chunk->SetFlagNonExecutable(MemoryChunk::FROM_PAGE);
+    current->ClearFlagNonExecutable(MemoryChunk::TO_PAGE);
+    current->SetFlagNonExecutable(MemoryChunk::FROM_PAGE);
     current->marking_progress_tracker().ResetIfEnabled();
     EvacuateExternalPointerReferences(current);
     old_lo_space->PromoteNewLargeObject(current);

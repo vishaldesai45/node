@@ -25,11 +25,13 @@
 #include "src/objects/fixed-array.h"
 #include "src/objects/foreign.h"
 #include "src/objects/heap-number.h"
+#include "src/objects/heap-object.h"
 #include "src/objects/hole.h"
 #include "src/objects/js-function.h"
 #include "src/objects/js-objects.h"
 #include "src/objects/js-promise.h"
 #include "src/objects/js-proxy.h"
+#include "src/objects/number-string-cache.h"
 #include "src/objects/objects.h"
 #include "src/objects/oddball.h"
 #include "src/objects/shared-function-info.h"
@@ -140,6 +142,16 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
 #else
 #error Unknown architecture.
 #endif
+
+  // Convert<T> is intended to handle all converting type changes, i.e. when
+  // the underlying representation may change (extend, truncate, ...) in
+  // some way.
+  //
+  // See also convert.tq.
+  //
+  // Please add new overloads as convenient.
+  template <class To, class From>
+  TNode<To> Convert(TNode<From> from);
 
   TNode<IntPtrT> TaggedIndexToIntPtr(TNode<TaggedIndex> value);
   TNode<TaggedIndex> IntPtrToTaggedIndex(TNode<IntPtrT> value);
@@ -375,6 +387,8 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<Int64T> CountLeadingZeros64(TNode<Word64T> value);
   TNode<Int32T> CountLeadingZeros32(TNode<Word32T> value);
 
+  TNode<Int32T> NumberToMathClz32(TNode<Number> value);
+
   // Round the 32bits payload of the provided word up to the next power of two.
   TNode<IntPtrT> IntPtrRoundUpToPowerOfTwo32(TNode<IntPtrT> value);
   // Select the maximum of the two provided IntPtr values.
@@ -604,6 +618,12 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<Number> NumberAdd(TNode<Number> a, TNode<Number> b);
   TNode<Number> NumberSub(TNode<Number> a, TNode<Number> b);
   void GotoIfNotNumber(TNode<Object> value, Label* is_not_number);
+#ifdef V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+  void GotoIfNumberOrUndefined(TNode<Object> value,
+                               Label* is_number_or_undefined);
+  void GotoIfNotNumberOrUndefined(TNode<Object> value,
+                                  Label* is_not_number_or_undefined);
+#endif  // V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
   void GotoIfNumber(TNode<Object> value, Label* is_number);
   TNode<Number> SmiToNumber(TNode<Smi> v) { return v; }
 
@@ -1170,6 +1190,14 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<Uint8T> LoadUint8Ptr(TNode<RawPtrT> ptr, TNode<IntPtrT> offset);
   TNode<Uint64T> LoadUint64Ptr(TNode<RawPtrT> ptr, TNode<IntPtrT> index);
 
+  template <class Type>
+  void StoreRawArgument(uint32_t index, TNode<Type> value) {
+    DCHECK_LT(index, IsolateData::GetRawArgumentCount());
+    StoreNoWriteBarrier(MachineRepresentationOf<Type>::value,
+                        IsolateField(IsolateFieldId::kRawArguments),
+                        IntPtrConstant(index * kDoubleSize), value);
+  }
+
   // Load a field from an object on the heap.
   template <typename T>
   TNode<T> LoadObjectField(TNode<HeapObject> object, int offset) {
@@ -1254,7 +1282,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   {
     if (IsMapOffsetConstant(reference.offset)) {
       TNode<Map> map = LoadMap(CAST(reference.object));
-      DCHECK((std::is_base_of<T, Map>::value));
+      DCHECK((std::is_base_of_v<T, Map>));
       return ReinterpretCast<T>(map);
     }
 
@@ -1280,7 +1308,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
     requires(std::is_convertible_v<TNode<T>, TNode<MaybeObject>>)
   {
     if (IsMapOffsetConstant(reference.offset)) {
-      DCHECK((std::is_base_of<T, Map>::value));
+      DCHECK((std::is_base_of_v<T, Map>));
       return StoreMap(CAST(reference.object), ReinterpretCast<Map>(value));
     }
     MachineRepresentation rep = MachineRepresentationOf<T>::value;
@@ -1459,6 +1487,8 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
     return Word32BinaryNot(IsCleared(value));
   }
 
+  TNode<MaybeObject> PrototypeChainInvalidConstant();
+
   // Removes the weak bit + asserts it was set.
   TNode<HeapObject> GetHeapObjectAssumeWeak(TNode<MaybeObject> value);
 
@@ -1575,16 +1605,9 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
                                                TNode<IntPtrT> index,
                                                int additional_offset = 0);
 
-  // Load an array element from a FixedDoubleArray.
   TNode<Float64T> LoadFixedDoubleArrayElement(
-      TNode<FixedDoubleArray> object, TNode<IntPtrT> index,
-      Label* if_hole = nullptr,
-      MachineType machine_type = MachineType::Float64());
-#ifdef V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
-  TNode<Float64T> LoadFixedDoubleArrayElementWithUndefinedCheck(
       TNode<FixedDoubleArray> object, TNode<IntPtrT> index, Label* if_undefined,
       Label* if_hole, MachineType machine_type = MachineType::Float64());
-#endif  // V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
 
   // Load an array element from a FixedArray, FixedDoubleArray or a
   // NumberDictionary (depending on the |elements_kind|) and return
@@ -1605,20 +1628,22 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<IntPtrT> LoadFeedbackVectorLength(TNode<FeedbackVector>);
   TNode<Float64T> LoadDoubleWithHoleCheck(TNode<FixedDoubleArray> array,
                                           TNode<IntPtrT> index,
-                                          Label* if_hole = nullptr);
+                                          Label* if_undefined, Label* if_hole);
 
   TNode<BoolT> IsDoubleHole(TNode<Object> base, TNode<IntPtrT> offset);
 #ifdef V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
   TNode<BoolT> IsDoubleUndefined(TNode<Object> base, TNode<IntPtrT> offset);
   TNode<BoolT> IsDoubleUndefined(TNode<Float64T> value);
 #endif  // V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+
+#ifdef V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+  TNode<Float64T> LoadDoubleWithUndefinedAndHoleCheck(
+      TNode<Object> base, TNode<IntPtrT> offset, Label* if_undefined,
+      Label* if_hole, MachineType machine_type = MachineType::Float64());
+#else
   // Load Float64 value by |base| + |offset| address. If the value is a double
   // hole then jump to |if_hole|. If |machine_type| is None then only the hole
   // check is generated.
-  TNode<Float64T> LoadDoubleWithHoleCheck(
-      TNode<Object> base, TNode<IntPtrT> offset, Label* if_hole,
-      MachineType machine_type = MachineType::Float64());
-#ifdef V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
   TNode<Float64T> LoadDoubleWithUndefinedAndHoleCheck(
       TNode<Object> base, TNode<IntPtrT> offset, Label* if_undefined,
       Label* if_hole, MachineType machine_type = MachineType::Float64());
@@ -1646,6 +1671,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<BoolT> LoadScopeInfoHasExtensionField(TNode<ScopeInfo> scope_info);
   TNode<BoolT> LoadScopeInfoClassScopeHasPrivateBrand(
       TNode<ScopeInfo> scope_info);
+  TNode<IntPtrT> LoadScopeInfoContextLocalCount(TNode<ScopeInfo> scope_info);
 
   // Context manipulation:
   void StoreContextElementNoWriteBarrier(TNode<Context> context, int slot_index,
@@ -1688,9 +1714,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<HeapObject> LoadJSFunctionPrototype(TNode<JSFunction> function,
                                             Label* if_bailout);
 
-  // Load the "code" property of a JSFunction.
-  TNode<Code> LoadJSFunctionCode(TNode<JSFunction> function);
-
   TNode<Object> LoadSharedFunctionInfoTrustedData(
       TNode<SharedFunctionInfo> sfi);
   TNode<Object> LoadSharedFunctionInfoUntrustedData(
@@ -1711,6 +1734,11 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<WasmJSFunctionData> LoadSharedFunctionInfoWasmJSFunctionData(
       TNode<SharedFunctionInfo> sfi);
 #endif  // V8_ENABLE_WEBASSEMBLY
+
+  TNode<BytecodeArray> LoadInterpreterDataBytecodeArray(
+      TNode<InterpreterData> data);
+  TNode<Code> LoadInterpreterDataInterpreterTrampoline(
+      TNode<InterpreterData> data);
 
   TNode<Int32T> LoadBytecodeArrayParameterCount(
       TNode<BytecodeArray> bytecode_array);
@@ -1827,9 +1855,9 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
       int additional_offset = 0,
       CheckBounds check_bounds = CheckBounds::kAlways) {
     // TODO(v8:9708): Do we want to keep both IntPtrT and UintPtrT variants?
-    static_assert(std::is_same<TIndex, Smi>::value ||
-                      std::is_same<TIndex, UintPtrT>::value ||
-                      std::is_same<TIndex, IntPtrT>::value,
+    static_assert(std::is_same_v<TIndex, Smi> ||
+                      std::is_same_v<TIndex, UintPtrT> ||
+                      std::is_same_v<TIndex, IntPtrT>,
                   "Only Smi, UintPtrT or IntPtrT index is allowed");
     if (NeedsBoundsCheck(check_bounds)) {
       FixedArrayBoundsCheck(array, index, additional_offset);
@@ -1841,9 +1869,9 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   template <typename TIndex>
   void StoreFixedArrayElement(TNode<FixedArray> array, TNode<TIndex> index,
                               TNode<Smi> value, int additional_offset = 0) {
-    static_assert(std::is_same<TIndex, Smi>::value ||
-                      std::is_same<TIndex, IntPtrT>::value,
-                  "Only Smi or IntPtrT indeces is allowed");
+    static_assert(
+        std::is_same_v<TIndex, Smi> || std::is_same_v<TIndex, IntPtrT>,
+        "Only Smi or IntPtrT indeces is allowed");
     StoreFixedArrayElement(array, index, TNode<Object>{value},
                            UNSAFE_SKIP_WRITE_BARRIER, additional_offset);
   }
@@ -1940,8 +1968,11 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   void StoreFixedDoubleArrayHole(TNode<FixedDoubleArray> array,
                                  TNode<IntPtrT> index);
 #ifdef V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+  template <typename TIndex>
+    requires(std::is_same_v<TIndex, Smi> || std::is_same_v<TIndex, UintPtrT> ||
+             std::is_same_v<TIndex, IntPtrT>)
   void StoreFixedDoubleArrayUndefined(TNode<FixedDoubleArray> array,
-                                      TNode<IntPtrT> index);
+                                      TNode<TIndex> index);
 #endif  // V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
   void StoreFeedbackVectorSlot(
       TNode<FeedbackVector> feedback_vector, TNode<UintPtrT> slot,
@@ -2003,6 +2034,9 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
     return AllocateHeapNumberWithValue(Float64Constant(value));
   }
 
+  // Allocate a shared HeapNumber with a specific value.
+  TNode<HeapNumber> AllocateSharedHeapNumberWithValue(TNode<Float64T> value);
+
   TNode<ContextCell> AllocateContextCell(TNode<Object> value);
 
   // Allocate a BigInt with {length} digits. Sets the sign bit to {false}.
@@ -2063,6 +2097,14 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
       TNode<IntPtrT> at_least_space_for,
       AllocationFlags = AllocationFlag::kNone);
   TNode<PropertyDictionary> AllocatePropertyDictionaryWithCapacity(
+      TNode<IntPtrT> capacity, AllocationFlags = AllocationFlag::kNone);
+
+  TNode<SimpleNameDictionary> AllocateSimpleNameDictionary(
+      int at_least_space_for);
+  TNode<SimpleNameDictionary> AllocateSimpleNameDictionary(
+      TNode<IntPtrT> at_least_space_for,
+      AllocationFlags = AllocationFlag::kNone);
+  TNode<SimpleNameDictionary> AllocateSimpleNameDictionaryWithCapacity(
       TNode<IntPtrT> capacity, AllocationFlags = AllocationFlag::kNone);
 
   TNode<NameDictionary> CopyNameDictionary(TNode<NameDictionary> dictionary,
@@ -2238,6 +2280,9 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
                                            TNode<Object> value,
                                            TNode<Boolean> done);
 
+  TNode<JSArray> AllocateJSIteratorResultValueForEntry(TNode<Context> context,
+                                                       TNode<Object> key,
+                                                       TNode<Object> value);
   // TODO(v8:9722): Return type should be JSIteratorResult
   TNode<JSObject> AllocateJSIteratorResultForEntry(TNode<Context> context,
                                                    TNode<Object> key,
@@ -2815,10 +2860,12 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<BoolT> IsJSReceiverInstanceType(TNode<Int32T> instance_type);
   TNode<BoolT> IsJSReceiverMap(TNode<Map> map);
   TNode<BoolT> IsJSReceiver(TNode<HeapObject> object);
-  // The following two methods assume that we deal either with a primitive
+  // The following four methods assume that we deal either with a primitive
   // object or a JS receiver.
   TNode<BoolT> JSAnyIsNotPrimitiveMap(TNode<Map> map);
   TNode<BoolT> JSAnyIsNotPrimitive(TNode<HeapObject> object);
+  TNode<BoolT> JSAnyIsPrimitiveMap(TNode<Map> map);
+  TNode<BoolT> JSAnyIsPrimitive(TNode<HeapObject> object);
   TNode<BoolT> IsJSRegExp(TNode<HeapObject> object);
   TNode<BoolT> IsJSTypedArrayInstanceType(TNode<Int32T> instance_type);
   TNode<BoolT> IsJSTypedArrayMap(TNode<Map> map);
@@ -2883,7 +2930,9 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<BoolT> IsSymbolInstanceType(TNode<Int32T> instance_type);
   TNode<BoolT> IsInternalizedStringInstanceType(TNode<Int32T> instance_type);
   TNode<BoolT> IsSharedStringInstanceType(TNode<Int32T> instance_type);
+#ifdef V8_TEMPORAL_SUPPORT
   TNode<BoolT> IsTemporalInstantInstanceType(TNode<Int32T> instance_type);
+#endif  // V8_TEMPORAL_SUPPORT
   TNode<BoolT> IsUniqueName(TNode<HeapObject> object);
   TNode<BoolT> IsUniqueNameNoIndex(TNode<HeapObject> object);
   TNode<BoolT> IsUniqueNameNoCachedIndex(TNode<HeapObject> object);
@@ -2902,6 +2951,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<BoolT> IsNumberStringNotRegexpLikeProtectorCellInvalid();
   TNode<BoolT> IsSetIteratorProtectorCellInvalid();
   TNode<BoolT> IsMapIteratorProtectorCellInvalid();
+  TNode<BoolT> IsStringWrapperToPrimitiveProtectorCellInvalid();
   void InvalidateStringWrapperToPrimitiveProtector();
 
   TNode<IntPtrT> LoadMemoryChunkFlags(TNode<HeapObject> object);
@@ -2935,11 +2985,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
     } else {
       return BoolConstant(false);
     }
-  }
-
-  TNode<BoolT> IsScriptContextCellsFlag() {
-    return LoadRuntimeFlag(
-        ExternalReference::address_of_script_context_cells_flag());
   }
 
   // True iff |object| is a Smi or a HeapNumber or a BigInt.
@@ -2986,6 +3031,9 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   bool IsFastPackedElementsKind(ElementsKind kind) {
     return v8::internal::IsFastPackedElementsKind(kind);
   }
+  bool IsSmiElementsKind(ElementsKind kind) {
+    return v8::internal::IsSmiElementsKind(kind);
+  }
   TNode<BoolT> IsFastOrNonExtensibleOrSealedElementsKind(
       TNode<Int32T> elements_kind);
 
@@ -3000,6 +3048,9 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<BoolT> IsFastSmiElementsKind(TNode<Int32T> elements_kind);
   TNode<BoolT> IsHoleyFastElementsKind(TNode<Int32T> elements_kind);
   TNode<BoolT> IsHoleyFastElementsKindForRead(TNode<Int32T> elements_kind);
+  bool IsHoleyElementsKind(ElementsKind kind) {
+    return v8::internal::IsHoleyElementsKind(kind);
+  }
   TNode<BoolT> IsElementsKindGreaterThan(TNode<Int32T> target_kind,
                                          ElementsKind reference_kind);
   TNode<BoolT> IsElementsKindGreaterThanOrEqual(TNode<Int32T> target_kind,
@@ -3029,6 +3080,15 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   // Convert a Number to a String.
   TNode<String> NumberToString(TNode<Number> input);
   TNode<String> NumberToString(TNode<Number> input, Label* bailout);
+
+  // If bailout label is not provided, then it doesn't try to grow the cache.
+  TNode<String> SmiToString(TNode<Smi> input, Label* bailout = nullptr);
+
+  TNode<String> Float64ToString(TNode<Float64T> input);
+  TNode<String> Float64ToString(TNode<Float64T> input, Label* bailout);
+
+  TNode<String> TryMatchPreallocatedNumberString(TNode<Int32T> value,
+                                                 Label* bailout);
 
   // Convert a Non-Number object to a Number.
   TNode<Number> NonNumberToNumber(
@@ -3382,7 +3442,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   void SetNumberOfElements(TNode<Dictionary> dictionary,
                            TNode<Smi> num_elements_smi) {
     // Not supposed to be used for SwissNameDictionary.
-    static_assert(!(std::is_same<Dictionary, SwissNameDictionary>::value));
+    static_assert(!(std::is_same_v<Dictionary, SwissNameDictionary>));
 
     StoreFixedArrayElement(dictionary, Dictionary::kNumberOfElementsIndex,
                            num_elements_smi, SKIP_WRITE_BARRIER);
@@ -3391,7 +3451,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   template <class Dictionary>
   TNode<Smi> GetNumberOfDeletedElements(TNode<Dictionary> dictionary) {
     // Not supposed to be used for SwissNameDictionary.
-    static_assert(!(std::is_same<Dictionary, SwissNameDictionary>::value));
+    static_assert(!(std::is_same_v<Dictionary, SwissNameDictionary>));
 
     return CAST(LoadFixedArrayElement(
         dictionary, Dictionary::kNumberOfDeletedElementsIndex));
@@ -3401,7 +3461,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   void SetNumberOfDeletedElements(TNode<Dictionary> dictionary,
                                   TNode<Smi> num_deleted_smi) {
     // Not supposed to be used for SwissNameDictionary.
-    static_assert(!(std::is_same<Dictionary, SwissNameDictionary>::value));
+    static_assert(!(std::is_same_v<Dictionary, SwissNameDictionary>));
 
     StoreFixedArrayElement(dictionary,
                            Dictionary::kNumberOfDeletedElementsIndex,
@@ -3411,7 +3471,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   template <class Dictionary>
   TNode<Smi> GetCapacity(TNode<Dictionary> dictionary) {
     // Not supposed to be used for SwissNameDictionary.
-    static_assert(!(std::is_same<Dictionary, SwissNameDictionary>::value));
+    static_assert(!(std::is_same_v<Dictionary, SwissNameDictionary>));
 
     return CAST(
         UnsafeLoadFixedArrayElement(dictionary, Dictionary::kCapacityIndex));
@@ -4127,8 +4187,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
 
   // JSTypedArray helpers
   TNode<UintPtrT> LoadJSTypedArrayLength(TNode<JSTypedArray> typed_array);
-  void StoreJSTypedArrayLength(TNode<JSTypedArray> typed_array,
-                               TNode<UintPtrT> value);
   TNode<UintPtrT> LoadJSTypedArrayLengthAndCheckDetached(
       TNode<JSTypedArray> typed_array, Label* detached);
   // Helper for length tracking JSTypedArrays and JSTypedArrays backed by
@@ -4156,8 +4214,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
                               TNode<UintPtrT> index,
                               Label* detached_or_out_of_bounds);
 
-  TNode<IntPtrT> RabGsabElementsKindToElementByteSize(
-      TNode<Int32T> elementsKind);
+  TNode<Uint8T> ElementsKindToElementByteShift(TNode<Int32T> elementsKind);
   TNode<RawPtrT> LoadJSTypedArrayDataPtr(TNode<JSTypedArray> typed_array);
   TNode<JSArrayBuffer> GetTypedArrayBuffer(TNode<Context> context,
                                            TNode<JSTypedArray> array);
@@ -4304,6 +4361,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   void Print(TNode<MaybeObject> tagged_value) {
     return Print(nullptr, tagged_value);
   }
+  void Print(const char* prefix, TNode<Uint32T> value);
   void Print(const char* prefix, TNode<UintPtrT> value);
   void Print(const char* prefix, TNode<Float64T> value);
   void PrintErr(const char* s);
@@ -4314,6 +4372,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   void PrintToStream(const char* s, int stream);
   void PrintToStream(const char* prefix, TNode<MaybeObject> tagged_value,
                      int stream);
+  void PrintToStream(const char* prefix, TNode<Uint32T> value, int stream);
   void PrintToStream(const char* prefix, TNode<UintPtrT> value, int stream);
   void PrintToStream(const char* prefix, TNode<Float64T> value, int stream);
 
@@ -4783,6 +4842,25 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   void TryPlainPrimitiveNonNumberToNumber(TNode<HeapObject> input,
                                           TVariable<Number>* var_result,
                                           Label* if_bailout);
+
+  // Checks if the value falls into [range_start, range_start+table_size) range
+  // and returns respective root entry [table_start, table_start+table_size).
+  // Otherwise jumps to out_of_range label.
+  // If the label is not provided, CSA_DCHECK is generated to ensure the range.
+  TNode<Object> TryMatchRootRange(TNode<Int32T> value, unsigned range_start,
+                                  RootIndex table_start, unsigned table_size,
+                                  Label* out_of_range);
+
+  // Helpers for DoubleStringCache access.
+  TNode<IntPtrT> DoubleStringCacheEntryToOffset(TNode<Word32T> entry);
+  void GotoIfNotDoubleStringCacheEntryKeyEqual(TNode<DoubleStringCache> cache,
+                                               TNode<IntPtrT> entry_offset,
+                                               TNode<Int32T> key_low,
+                                               TNode<Int32T> key_high,
+                                               Label* if_not_equal);
+  TNode<String> LoadDoubleStringCacheEntryValue(TNode<DoubleStringCache> cache,
+                                                TNode<IntPtrT> entry_offset,
+                                                Label* if_empty_entry);
 
   void DcheckHasValidMap(TNode<HeapObject> object);
 

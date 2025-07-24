@@ -489,8 +489,8 @@ std::ostream& operator<<(std::ostream& os, const FlagsMode& fm) {
       return os << "trap";
     case kFlags_select:
       return os << "select";
-    case kFlags_conditional_set:
-      return os << "conditional set";
+    case kFlags_conditional_trap:
+      return os << "conditional trap";
     case kFlags_conditional_branch:
       return os << "conditional branch";
   }
@@ -835,7 +835,8 @@ InstructionBlocks* InstructionSequence::InstructionBlocksFor(
   // headers. Since it's somewhat expensive to compute this, we should also use
   // the LoopFinder to compute the special RPO (we would only need to run the
   // LoopFinder once to compute both the special RPO and the loop headers).
-  turboshaft::LoopFinder loop_finder(zone, &graph);
+  turboshaft::LoopFinder loop_finder(zone, &graph,
+                                     turboshaft::LoopFinder::Config{});
   for (const turboshaft::Block& block : graph.blocks()) {
     DCHECK(!(*blocks)[rpo_number]);
     DCHECK_EQ(RpoNumber::FromInt(block.index().id()).ToSize(), rpo_number);
@@ -936,9 +937,23 @@ void InstructionSequence::ComputeAssemblyOrder() {
       }
       block->set_loop_header_alignment(header_align);
     }
-    if (block->loop_header().IsValid() && block->IsTableSwitchTarget()) {
-      block->set_code_target_alignment(true);
+    if (block->loop_header().IsValid()) {
+      if (block->IsTableSwitchTarget()) {
+        block->set_code_target_alignment(true);
+      } else {
+        // If this block has no fallthrough predecessors then it can only be
+        // accessed via a jump.
+        RpoNumber ao_pred_block = ao_blocks_->back()->rpo_number();
+        if (std::none_of(block->predecessors().begin(),
+                         block->predecessors().end(),
+                         [&ao_pred_block](RpoNumber pred) {
+                           return pred == ao_pred_block;
+                         })) {
+          block->set_code_target_alignment(true);
+        }
+      }
     }
+
     block->set_ao_number(RpoNumber::FromInt(ao++));
     ao_blocks_->push_back(block);
   }

@@ -110,6 +110,25 @@ CallKnownJSFunction::CallKnownJSFunction(
   set_input(kNewTargetIndex, new_target);
 }
 
+void NodeBase::OverwriteWithIdentityTo(ValueNode* node) {
+  // OverwriteWith() checks if the node we're overwriting to has the same
+  // input count and the same properties. Here we don't need to do that, since
+  // overwriting with a node with property pure, we only need to check if
+  // there is at least 1 input. Since the first input is always the one
+  // closest to the input_base().
+  DCHECK_GE(input_count(), 1);
+  // Remove use of all inputs first.
+  for (Input& input : *this) {
+    input.clear();
+  }
+  // Unfortunately we cannot remove uses from deopt frames, since these could be
+  // shared with other nodes.
+  set_opcode(Opcode::kIdentity);
+  set_properties(StaticPropertiesForOpcode(Opcode::kIdentity));
+  bitfield_ = InputCountField::update(bitfield_, 1);
+  set_input(0, node);
+}
+
 }  // namespace maglev
 }  // namespace internal
 }  // namespace v8

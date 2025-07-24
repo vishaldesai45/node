@@ -604,33 +604,35 @@ V8_INLINE void AtomicZapBlock(Address addr, size_t size_in_bytes) {
   }
 }
 
-void ZapDeadObjectsInRange(Heap* heap, Address dead_start, Address dead_end) {
-  if (dead_end != dead_start) {
-    size_t free_size = static_cast<size_t>(dead_end - dead_start);
-    AtomicZapBlock(dead_start, free_size);
-    WritableFreeSpace free_space =
-        WritableFreeSpace::ForNonExecutableMemory(dead_start, free_size);
-    heap->CreateFillerObjectAtBackground(free_space);
-  }
-}
-
-void ZapDeadObjectsOnPage(Heap* heap, PageMetadata* p) {
-  if (!heap::ShouldZapGarbage() && !v8_flags.track_gc_object_stats) {
+enum class ZappingMode { kNone, kCreateFillers, kCreateFillersAndZap };
+ZappingMode ShouldZapDeadObjectsOnPage() {
+  if (heap::ShouldZapGarbage() || v8_flags.track_gc_object_stats) {
     // We need to zap and create fillers on promoted pages when
     // --track-gc-object-stats is enabled because it expects all dead objects to
     // still be valid objects. Dead object on promoted pages may otherwise
     // contain invalid old-to-new references to pages that are gone or were
     // already reallocated.
-    return;
+    return ZappingMode::kCreateFillersAndZap;
   }
-  Address dead_start = p->area_start();
-  // Iterate over the page using the live objects.
-  for (auto [object, size] : LiveObjectRange(p)) {
-    Address dead_end = object.address();
-    ZapDeadObjectsInRange(heap, dead_start, dead_end);
-    dead_start = dead_end + size;
+  // Conservative stack scanning requires fillers over all dead objects
+  // otherwise a false reference found on stack may result in resurrecting a
+  // dead object.
+  return v8_flags.conservative_stack_scanning ? ZappingMode::kCreateFillers
+                                              : ZappingMode::kNone;
+}
+
+void ZapDeadObjectsInRange(Heap* heap, Address dead_start, Address dead_end,
+                           const ZappingMode zapping_mode) {
+  DCHECK_NE(ZappingMode::kNone, zapping_mode);
+  if (dead_end != dead_start) {
+    size_t free_size = static_cast<size_t>(dead_end - dead_start);
+    if (zapping_mode == ZappingMode::kCreateFillersAndZap) {
+      AtomicZapBlock(dead_start, free_size);
+    }
+    WritableFreeSpace free_space =
+        WritableFreeSpace::ForNonExecutableMemory(dead_start, free_size);
+    heap->CreateFillerObjectAtBackground(free_space);
   }
-  ZapDeadObjectsInRange(heap, dead_start, p->area_end());
 }
 
 }  // namespace
@@ -648,7 +650,7 @@ void Sweeper::LocalSweeper::ParallelIteratePromotedPage(
     page->set_concurrent_sweeping_state(
         PageMetadata::ConcurrentSweepingState::kInProgress);
     PromotedPageRecordMigratedSlotVisitor record_visitor(page);
-    const bool is_large_page = page->Chunk()->IsLargePage();
+    const bool is_large_page = page->is_large();
     if (is_large_page) {
       DCHECK_EQ(LO_SPACE, page->owner_identity());
       record_visitor.Process(LargePageMetadata::cast(page)->GetObject());
@@ -656,11 +658,22 @@ void Sweeper::LocalSweeper::ParallelIteratePromotedPage(
     } else {
       DCHECK_EQ(OLD_SPACE, page->owner_identity());
       DCHECK(!page->Chunk()->IsEvacuationCandidate());
-      for (auto [object, _] :
+      const ZappingMode zapping_mode = ShouldZapDeadObjectsOnPage();
+      Address dead_start = page->area_start();
+      for (auto [object, size] :
            LiveObjectRange(static_cast<PageMetadata*>(page))) {
         record_visitor.Process(object);
+        if (zapping_mode != ZappingMode::kNone) {
+          Address dead_end = object.address();
+          ZapDeadObjectsInRange(sweeper_->heap_, dead_start, dead_end,
+                                zapping_mode);
+          dead_start = dead_end + size.value();
+        }
       }
-      ZapDeadObjectsOnPage(sweeper_->heap_, static_cast<PageMetadata*>(page));
+      if (zapping_mode != ZappingMode::kNone) {
+        ZapDeadObjectsInRange(sweeper_->heap_, dead_start, page->area_end(),
+                              zapping_mode);
+      }
     }
     page->ClearLiveness();
     sweeper_->NotifyPromotedPageIterationFinished(page);
@@ -763,13 +776,29 @@ void Sweeper::StartMajorSweeperTasks() {
 }
 
 namespace {
+
+void ZapDeadObjectsOnPage(Heap* heap, PageMetadata* p) {
+  const ZappingMode zapping_mode = ShouldZapDeadObjectsOnPage();
+  if (zapping_mode == ZappingMode::kNone) {
+    return;
+  }
+  Address dead_start = p->area_start();
+  // Iterate over the page using the live objects.
+  for (auto [object, size] : LiveObjectRange(p)) {
+    Address dead_end = object.address();
+    ZapDeadObjectsInRange(heap, dead_start, dead_end, zapping_mode);
+    dead_start = dead_end + size.value();
+  }
+  ZapDeadObjectsInRange(heap, dead_start, p->area_end(), zapping_mode);
+}
+
 void ClearPromotedPages(Heap* heap, std::vector<MutablePageMetadata*> pages) {
   DCHECK(v8_flags.minor_ms);
   for (auto* page : pages) {
     DCHECK(!page->SweepingDone());
     DCHECK_EQ(PageMetadata::ConcurrentSweepingState::kPendingIteration,
               page->concurrent_sweeping_state());
-    if (!page->Chunk()->IsLargePage()) {
+    if (!page->is_large()) {
       ZapDeadObjectsOnPage(heap, static_cast<PageMetadata*>(page));
     }
     page->ClearLiveness();
@@ -777,6 +806,7 @@ void ClearPromotedPages(Heap* heap, std::vector<MutablePageMetadata*> pages) {
         PageMetadata::ConcurrentSweepingState::kDone);
   }
 }
+
 }  // namespace
 
 void Sweeper::StartMinorSweeperTasks() {
@@ -996,17 +1026,17 @@ std::optional<base::AddressRegion> Sweeper::ComputeDiscardMemoryArea(
 
 void Sweeper::ZeroOrDiscardUnusedMemory(PageMetadata* page, Address addr,
                                         size_t size) {
-  if (size < FreeSpace::kSize) {
+  if (size < sizeof(FreeSpace)) {
     return;
   }
 
-  const Address unused_start = addr + FreeSpace::kSize;
+  const Address unused_start = addr + sizeof(FreeSpace);
   DCHECK(page->ContainsLimit(unused_start));
   const Address unused_end = addr + size;
   DCHECK(page->ContainsLimit(unused_end));
 
   std::optional<RwxMemoryWriteScope> scope;
-  if (page->Chunk()->executable()) {
+  if (page->is_executable()) {
     scope.emplace("For zeroing unused memory.");
   }
   const std::optional<base::AddressRegion> discard_area =
@@ -1186,8 +1216,8 @@ void Sweeper::RawSweep(PageMetadata* p,
           free_start, free_end, p, record_free_ranges, &free_ranges_map,
           sweeping_mode);
     }
-    live_bytes += size;
-    free_start = free_end + size;
+    live_bytes += size.value();
+    free_start = free_end + size.value();
 
     if (active_system_pages_after_sweeping) {
       MemoryChunk* chunk = p->Chunk();
@@ -1396,7 +1426,7 @@ void Sweeper::AddPromotedPage(MutablePageMetadata* chunk) {
   heap_->IncrementYoungSurvivorsCounter(live_bytes);
   DCHECK_EQ(PageMetadata::ConcurrentSweepingState::kDone,
             chunk->concurrent_sweeping_state());
-  if (!chunk->Chunk()->IsLargePage()) {
+  if (!chunk->is_large()) {
     PrepareToBeIteratedPromotedPage(static_cast<PageMetadata*>(chunk));
   } else {
     chunk->set_concurrent_sweeping_state(
@@ -1550,7 +1580,7 @@ void Sweeper::SweepEmptyNewSpacePage(PageMetadata* page) {
   page->ResetAllocationStatistics();
   page->ResetAgeInNewSpace();
   page->ReleaseSlotSet(SURVIVOR_TO_EXTERNAL_POINTER);
-  page->Chunk()->ClearFlagNonExecutable(MemoryChunk::NEVER_ALLOCATE_ON_PAGE);
+  page->ClearFlagNonExecutable(MemoryChunk::NEVER_ALLOCATE_ON_PAGE);
   paged_space->FreeDuringSweep(start, size);
   paged_space->IncreaseAllocatedBytes(0, page);
   paged_space->RelinkFreeListCategories(page);

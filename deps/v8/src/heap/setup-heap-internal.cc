@@ -286,7 +286,7 @@ void InitializePartialMap(Isolate* isolate, Tagged<Map> map,
   map->set_visitor_id(Map::GetVisitorId(map));
   map->set_inobject_properties_start_or_constructor_function_index(0);
   DCHECK(!IsJSObjectMap(map));
-  map->set_prototype_validity_cell(Map::kPrototypeChainValidSmi, kRelaxedStore);
+  map->set_prototype_validity_cell(Map::kNoValidityCellSentinel, kRelaxedStore);
   map->SetInObjectUnusedPropertyFields(0);
   map->set_bit_field(0);
   map->set_bit_field2(0);
@@ -414,6 +414,11 @@ bool Heap::CreateEarlyReadOnlyMapsAndObjects() {
     // Keep HeapNumber and BigInt maps together for cheaper numerics checks.
     ALLOCATE_AND_SET_ROOT(Map, heap_number_map, Map::kSize);
     ALLOCATE_AND_SET_ROOT(Map, bigint_map, Map::kSize);
+    // Keep FreeSpace and filler maps together for cheap
+    // `IsFreeSpaceOrFiller()`.
+    ALLOCATE_AND_SET_ROOT(Map, free_space_map, Map::kSize);
+    ALLOCATE_AND_SET_ROOT(Map, one_pointer_filler_map, Map::kSize);
+    ALLOCATE_AND_SET_ROOT(Map, two_pointer_filler_map, Map::kSize);
 
 #undef ALLOCATE_AND_SET_ROOT
 
@@ -432,6 +437,12 @@ bool Heap::CreateEarlyReadOnlyMapsAndObjects() {
         Context::NUMBER_FUNCTION_INDEX);
     InitializePartialMap(isolate(), bigint_map, meta_map, BIGINT_TYPE,
                          kVariableSizeSentinel);
+    InitializePartialMap(isolate(), free_space_map, meta_map, FREE_SPACE_TYPE,
+                         kVariableSizeSentinel);
+    InitializePartialMap(isolate(), one_pointer_filler_map, meta_map,
+                         FILLER_TYPE, kTaggedSize);
+    InitializePartialMap(isolate(), two_pointer_filler_map, meta_map,
+                         FILLER_TYPE, 2 * kTaggedSize);
 
     for (const StringTypeInit& entry : kStringTypeTable) {
       Tagged<Map> map = UncheckedCast<Map>(roots.object_at(entry.index));
@@ -603,6 +614,9 @@ bool Heap::CreateEarlyReadOnlyMapsAndObjects() {
   FinalizePartialMap(roots.bigint_map());
   FinalizePartialMap(roots.hole_map());
   FinalizePartialMap(roots.symbol_map());
+  FinalizePartialMap(roots.free_space_map());
+  FinalizePartialMap(roots.one_pointer_filler_map());
+  FinalizePartialMap(roots.two_pointer_filler_map());
   for (const StructInit& entry : kStructTable) {
     if (!is_important_struct(entry.type)) continue;
     FinalizePartialMap(Cast<Map>(roots.object_at(entry.index)));
@@ -649,7 +663,6 @@ bool Heap::CreateEarlyReadOnlyMapsAndObjects() {
     ALLOCATE_VARSIZE_MAP(BYTE_ARRAY_TYPE, byte_array)
     ALLOCATE_VARSIZE_MAP(TRUSTED_BYTE_ARRAY_TYPE, trusted_byte_array)
     ALLOCATE_VARSIZE_MAP(BYTECODE_ARRAY_TYPE, bytecode_array)
-    ALLOCATE_VARSIZE_MAP(FREE_SPACE_TYPE, free_space)
     ALLOCATE_VARSIZE_MAP(PROPERTY_ARRAY_TYPE, property_array)
     ALLOCATE_VARSIZE_MAP(SMALL_ORDERED_HASH_MAP_TYPE, small_ordered_hash_map)
     ALLOCATE_VARSIZE_MAP(SMALL_ORDERED_HASH_SET_TYPE, small_ordered_hash_set)
@@ -661,19 +674,17 @@ bool Heap::CreateEarlyReadOnlyMapsAndObjects() {
     ALLOCATE_MAP(CELL_TYPE, Cell::kSize, cell);
     {
       // The invalid_prototype_validity_cell is needed for JSObject maps.
-      Tagged<Smi> value = Smi::FromInt(Map::kPrototypeChainInvalid);
       AllocationResult alloc =
           AllocateRaw(Cell::kSize, AllocationType::kReadOnly);
       if (!alloc.To(&obj)) return false;
       obj->set_map_after_allocation(isolate(), roots.cell_map(),
                                     SKIP_WRITE_BARRIER);
-      Cast<Cell>(obj)->set_value(value);
+      Cast<Cell>(obj)->set_maybe_value(Map::kPrototypeChainInvalid,
+                                       SKIP_WRITE_BARRIER);
       set_invalid_prototype_validity_cell(Cast<Cell>(obj));
     }
 
     ALLOCATE_MAP(PROPERTY_CELL_TYPE, PropertyCell::kSize, global_property_cell)
-    ALLOCATE_MAP(FILLER_TYPE, kTaggedSize, one_pointer_filler)
-    ALLOCATE_MAP(FILLER_TYPE, 2 * kTaggedSize, two_pointer_filler)
 
     // The "no closures" and "one closure" FeedbackCell maps need
     // to be marked unstable because their objects can change maps.
@@ -746,6 +757,7 @@ bool Heap::CreateLateReadOnlyNonJSReceiverMaps() {
     ALLOCATE_VARSIZE_MAP(SIMPLE_NAME_DICTIONARY_TYPE, simple_name_dictionary)
     ALLOCATE_VARSIZE_MAP(NAME_TO_INDEX_HASH_TABLE_TYPE,
                          name_to_index_hash_table)
+    ALLOCATE_VARSIZE_MAP(DOUBLE_STRING_CACHE_TYPE, double_string_cache)
 
     ALLOCATE_VARSIZE_MAP(EMBEDDER_DATA_ARRAY_TYPE, embedder_data_array)
     ALLOCATE_VARSIZE_MAP(EPHEMERON_HASH_TABLE_TYPE, ephemeron_hash_table)
@@ -785,6 +797,8 @@ bool Heap::CreateLateReadOnlyNonJSReceiverMaps() {
             wasm_resume_data)
     IF_WASM(ALLOCATE_MAP, WASM_SUSPENDER_OBJECT_TYPE,
             WasmSuspenderObject::kSize, wasm_suspender_object)
+    IF_WASM(ALLOCATE_MAP, WASM_CONTINUATION_OBJECT_TYPE,
+            WasmContinuationObject::kSize, wasm_continuation_object)
     IF_WASM(ALLOCATE_MAP, WASM_TYPE_INFO_TYPE, kVariableSizeSentinel,
             wasm_type_info)
     IF_WASM(ALLOCATE_MAP, WASM_NULL_TYPE, kVariableSizeSentinel, wasm_null);
@@ -794,8 +808,22 @@ bool Heap::CreateLateReadOnlyNonJSReceiverMaps() {
             wasm_dispatch_table);
 
     ALLOCATE_MAP(WEAK_CELL_TYPE, WeakCell::kSize, weak_cell)
-    ALLOCATE_MAP(INTERPRETER_DATA_TYPE, InterpreterData::kSize,
+    ALLOCATE_MAP(INTERPRETER_DATA_TYPE, sizeof(InterpreterData),
                  interpreter_data)
+
+    ALLOCATE_MAP(UNCOMPILED_DATA_WITHOUT_PREPARSE_DATA_TYPE,
+                 sizeof(UncompiledDataWithoutPreparseData),
+                 uncompiled_data_without_preparse_data)
+    ALLOCATE_MAP(UNCOMPILED_DATA_WITH_PREPARSE_DATA_TYPE,
+                 sizeof(UncompiledDataWithPreparseData),
+                 uncompiled_data_with_preparse_data)
+    ALLOCATE_MAP(UNCOMPILED_DATA_WITHOUT_PREPARSE_DATA_WITH_JOB_TYPE,
+                 sizeof(UncompiledDataWithoutPreparseDataWithJob),
+                 uncompiled_data_without_preparse_data_with_job)
+    ALLOCATE_MAP(UNCOMPILED_DATA_WITH_PREPARSE_DATA_AND_JOB_TYPE,
+                 sizeof(UncompiledDataWithPreparseDataAndJob),
+                 uncompiled_data_with_preparse_data_and_job)
+
     ALLOCATE_MAP(SHARED_FUNCTION_INFO_WRAPPER_TYPE,
                  SharedFunctionInfoWrapper::kSize, shared_function_info_wrapper)
 
@@ -910,7 +938,8 @@ bool Heap::CreateImportantReadOnlyObjects() {
   // Hash seed for strings
 
   Factory* factory = isolate()->factory();
-  set_hash_seed(*factory->NewByteArray(kInt64Size, AllocationType::kReadOnly));
+  set_hash_seed(
+      *factory->NewByteArray(kInt64Size * 4, AllocationType::kReadOnly));
   InitializeHashSeed();
 
   // Important strings and symbols
@@ -1001,6 +1030,14 @@ bool Heap::CreateImportantReadOnlyObjects() {
 
   set_nan_value(*factory->NewHeapNumber<AllocationType::kReadOnly>(
       std::numeric_limits<double>::quiet_NaN()));
+#ifdef V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+  set_undefined_nan_value(
+      *factory->NewHeapNumberFromBits<AllocationType::kReadOnly>(
+          kUndefinedNanInt64));
+#else
+  set_undefined_nan_value(*factory->NewHeapNumber<AllocationType::kReadOnly>(
+      std::numeric_limits<double>::quiet_NaN()));
+#endif  // V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
   set_hole_nan_value(*factory->NewHeapNumberFromBits<AllocationType::kReadOnly>(
       kHoleNanInt64));
   set_infinity_value(
@@ -1106,7 +1143,8 @@ bool Heap::CreateReadOnlyObjects() {
 
   // Finish initializing oddballs after creating the string table.
   Oddball::Initialize(isolate(), factory->undefined_value(), "undefined",
-                      factory->nan_value(), "undefined", Oddball::kUndefined);
+                      factory->undefined_nan_value(), "undefined",
+                      Oddball::kUndefined);
 
   // Initialize the null_value.
   Oddball::Initialize(isolate(), factory->null_value(), "null",
@@ -1227,6 +1265,9 @@ bool Heap::CreateReadOnlyObjects() {
   DCHECK(!empty_symbol_table->HasSufficientCapacityToAdd(1));
   set_empty_symbol_table(*empty_symbol_table);
 
+  set_undefined_context_cell(*factory->NewContextCell(
+      factory->undefined_value(), AllocationType::kReadOnly));
+
   // Allocate the empty OrderedHashMap.
   DirectHandle<OrderedHashMap> empty_ordered_hash_map =
       OrderedHashMap::AllocateEmpty(isolate(), AllocationType::kReadOnly)
@@ -1266,6 +1307,36 @@ bool Heap::CreateReadOnlyObjects() {
       factory->NewManyClosuresCell(AllocationType::kReadOnly);
   set_many_closures_cell(*many_closures_cell);
 
+  // Allocate and initialize table for preallocated number strings.
+  {
+    HandleScope handle_scope(isolate());
+    Handle<FixedArray> preallocated_number_string_table =
+        factory->NewFixedArray(kPreallocatedNumberStringTableSize,
+                               AllocationType::kReadOnly);
+
+    char arr[16];
+    base::Vector<char> buffer(arr, arraysize(arr));
+
+    static_assert(kPreallocatedNumberStringTableSize >= 10);
+    for (int i = 0; i < 10; ++i) {
+      RootIndex root_index = RootsTable::SingleCharacterStringIndex('0' + i);
+      Tagged<String> str =
+          Cast<String>(factory->read_only_roots().object_at(root_index));
+      DCHECK(ReadOnlyHeap::Contains(str));
+      preallocated_number_string_table->set(i, str);
+    }
+
+    // This code duplicates FactoryBase::SmiToNumber.
+    for (int i = 10; i < kPreallocatedNumberStringTableSize; ++i) {
+      std::string_view string = IntToStringView(i, buffer);
+      Handle<String> str = factory->InternalizeString(
+          base::OneByteVector(string.data(), string.length()));
+
+      DCHECK(ReadOnlyHeap::Contains(*str));
+      preallocated_number_string_table->set(i, *str);
+    }
+    set_preallocated_number_string_table(*preallocated_number_string_table);
+  }
   // Initialize the wasm null_value.
 
 #ifdef V8_ENABLE_WEBASSEMBLY
@@ -1359,8 +1430,10 @@ void Heap::CreateInitialMutableObjects() {
   set_api_symbol_table(roots.empty_symbol_table());
   set_api_private_symbol_table(roots.empty_symbol_table());
 
-  set_number_string_cache(*factory->NewFixedArray(
-      kInitialNumberStringCacheSize * 2, AllocationType::kOld));
+  set_smi_string_cache(
+      *SmiStringCache::New(isolate(), SmiStringCache::kInitialSize));
+  set_double_string_cache(
+      *DoubleStringCache::New(isolate(), DoubleStringCache::kInitialSize));
 
   // Unchecked to skip failing checks since required roots are uninitialized.
   set_basic_block_profiling_data(roots.unchecked_empty_array_list());
@@ -1380,7 +1453,6 @@ void Heap::CreateInitialMutableObjects() {
   set_shared_wasm_memories(roots.empty_weak_array_list());
   set_locals_block_list_cache(roots.undefined_value());
 #ifdef V8_ENABLE_WEBASSEMBLY
-  set_active_suspender(roots.undefined_value());
   set_js_to_wasm_wrappers(roots.empty_weak_fixed_array());
   set_wasm_canonical_rtts(roots.empty_weak_fixed_array());
 #endif  // V8_ENABLE_WEBASSEMBLY
@@ -1406,9 +1478,9 @@ void Heap::CreateInitialMutableObjects() {
 
   // Protectors
   set_array_buffer_detaching_protector(*factory->NewProtector());
-  set_array_constructor_protector(*factory->NewProtector());
   set_array_iterator_protector(*factory->NewProtector());
   set_array_species_protector(*factory->NewProtector());
+  set_no_date_time_configuration_change_protector(*factory->NewProtector());
   set_is_concat_spreadable_protector(*factory->NewProtector());
   set_map_iterator_protector(*factory->NewProtector());
   set_no_elements_protector(*factory->NewProtector());
@@ -1425,7 +1497,6 @@ void Heap::CreateInitialMutableObjects() {
   set_string_length_protector(*factory->NewProtector());
   set_string_wrapper_to_primitive_protector(*factory->NewProtector());
   set_number_string_not_regexp_like_protector(*factory->NewProtector());
-  set_typed_array_length_protector(*factory->NewProtector());
   set_typed_array_species_protector(*factory->NewProtector());
 
   set_serialized_objects(roots.empty_fixed_array());

@@ -352,6 +352,11 @@ Address Builtins::CppEntryOf(Builtin builtin) {
   return builtin_metadata[ToInt(builtin)].data.cpp_entry;
 }
 
+Address Builtins::EmbeddedEntryOf(Builtin builtin) {
+  static_assert(Builtins::kAllBuiltinsAreIsolateIndependent);
+  return EmbeddedData::FromBlob().InstructionStartOf(builtin);
+}
+
 // static
 bool Builtins::IsBuiltin(const Tagged<Code> code) {
   return Builtins::IsBuiltinId(code->builtin_id());
@@ -384,8 +389,12 @@ void Builtins::InitializeIsolateDataTables(Isolate* isolate) {
   for (Builtin i = Builtins::kFirst; i <= Builtins::kLast; ++i) {
     DCHECK(Builtins::IsBuiltinId(isolate->builtins()->code(i)->builtin_id()));
     DCHECK(!isolate->builtins()->code(i)->has_instruction_stream());
+    Builtin builtin_id = i;
+#if V8_ENABLE_GEARBOX
+    builtin_id = isolate->builtins()->code(i)->builtin_id();
+#endif  // V8_ENABLE_GEARBOX
     isolate_data->builtin_entry_table()[ToInt(i)] =
-        embedded_data.InstructionStartOf(i);
+        embedded_data.InstructionStartOf(builtin_id);
   }
 
   // T0 tables.
@@ -528,6 +537,39 @@ CodeEntrypointTag Builtins::EntrypointTagFor(Builtin builtin) {
       return CallInterfaceDescriptorFor(builtin).tag();
   }
   UNREACHABLE();
+}
+
+// static
+CodeSandboxingMode Builtins::SandboxingModeOf(Builtin builtin) {
+  Kind kind = Builtins::KindOf(builtin);
+  switch (kind) {
+    case CPP:
+      // CPP builtins are invoked in sandboxed execution mode, but the CEntry
+      // trampoline will exit sandboxed mode before calling the actual C++ code.
+      // TODO(422994386): investigate running the C++ code in sandboxed mode.
+      return CodeSandboxingMode::kSandboxed;
+    case TSJ:
+    case TFJ:
+      // All builtins with JS linkage run sandboxed.
+      return CodeSandboxingMode::kSandboxed;
+    case TFH:
+    case BCH:
+      // Bytecode handlers and inline caches run sandboxed.
+      return CodeSandboxingMode::kSandboxed;
+    case TFS:
+      switch (builtin) {
+        // Microtask-related builtins run in privileged mode as they need write
+        // access to the MicrotaskQueue object.
+        case Builtin::kEnqueueMicrotask:
+          return CodeSandboxingMode::kUnsandboxed;
+        default:
+          return CodeSandboxingMode::kSandboxed;
+      }
+    case TSC:
+    case TFC:
+    case ASM:
+      return CallInterfaceDescriptorFor(builtin).sandboxing_mode();
+  }
 }
 
 // static

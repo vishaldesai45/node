@@ -37,6 +37,14 @@ struct GarbageCollectionSizes {
   int64_t bytes_freed = -1;
 };
 
+struct GarbageCollectionLimits {
+  int64_t bytes_baseline = -1;
+  int64_t bytes_limit = -1;
+  int64_t bytes_current = -1;
+  int64_t growing_bytes = -1;
+  double growing_factor = -1;
+};
+
 struct GarbageCollectionFullCycle {
   int reason = -1;
   // The priority of the isolate during the GC cycle. A nullopt value denotes a
@@ -55,6 +63,8 @@ struct GarbageCollectionFullCycle {
   GarbageCollectionSizes objects_cpp;
   GarbageCollectionSizes memory;
   GarbageCollectionSizes memory_cpp;
+  GarbageCollectionLimits old_generation_consumed;
+  GarbageCollectionLimits global_consumed;
   double collection_rate_in_percent = -1.0;
   double collection_rate_cpp_in_percent = -1.0;
   double efficiency_in_bytes_per_us = -1.0;
@@ -66,6 +76,7 @@ struct GarbageCollectionFullCycle {
   double main_thread_collection_weight_in_percent = -1.0;
   double main_thread_collection_weight_cpp_in_percent = -1.0;
   int64_t incremental_marking_start_stop_wall_clock_duration_in_us = -1;
+  int64_t total_duration_since_last_mark_compact = -1;
 };
 
 struct GarbageCollectionFullMainThreadIncrementalMark {

@@ -753,7 +753,8 @@ void ObjectStatsCollectorImpl::RecordVirtualFeedbackVectorDetails(
   // Iterate over the feedback slots and log each one.
   if (!vector->shared_function_info()->HasFeedbackMetadata()) return;
 
-  FeedbackMetadataIterator it(vector->metadata());
+  DisallowGarbageCollection no_gc;
+  FeedbackMetadataIterator it(vector->metadata(), no_gc);
   while (it.HasNext()) {
     FeedbackSlot slot = it.Next();
     // Log the entry (or entries) taken up by this slot.
@@ -867,7 +868,9 @@ void ObjectStatsCollectorImpl::CollectGlobalStatistics() {
   // FixedArray.
   RecordSimpleVirtualObjectStats(HeapObject(), heap_->serialized_objects(),
                                  StatsEnum::SERIALIZED_OBJECTS_TYPE);
-  RecordSimpleVirtualObjectStats(HeapObject(), heap_->number_string_cache(),
+  RecordSimpleVirtualObjectStats(HeapObject(), heap_->smi_string_cache(),
+                                 StatsEnum::NUMBER_STRING_CACHE_TYPE);
+  RecordSimpleVirtualObjectStats(HeapObject(), heap_->double_string_cache(),
                                  StatsEnum::NUMBER_STRING_CACHE_TYPE);
   RecordSimpleVirtualObjectStats(HeapObject(), heap_->string_split_cache(),
                                  StatsEnum::STRING_SPLIT_CACHE_TYPE);

@@ -29,6 +29,7 @@
 #include "src/objects/instance-type.h"
 #include "src/objects/js-function-inl.h"
 #include "src/objects/js-objects.h"
+#include "src/objects/shared-function-info-inl.h"
 #include "src/objects/struct.h"
 #include "src/regexp/regexp.h"
 #include "src/sandbox/isolate.h"
@@ -50,6 +51,25 @@ namespace v8::internal {
 
 namespace {
 constexpr char kUnavailableString[] = "unavailable";
+
+void PrintDouble(std::ostream& os, double val) {
+  if (i::IsMinusZero(val)) {
+    os << "-0.0";
+  } else if (val == DoubleToInteger(val) && val >= kMinSafeInteger &&
+             val <= kMaxSafeInteger) {
+    // Print integer HeapNumbers in safe integer range with max precision: as
+    // 9007199254740991.0 instead of 9.0072e+15
+    int64_t i = static_cast<int64_t>(val);
+    os << i << ".0";
+#ifdef V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+  } else if (std::isnan(val)) {
+    os << val << " (0x" << std::hex << base::double_to_uint64(val) << std::dec
+       << ")";
+#endif  // V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+  } else {
+    os << val;
+  }
+}
 }  // namespace
 
 #ifdef OBJECT_PRINT
@@ -182,12 +202,10 @@ void PrintDictionaryContents(std::ostream& os, Tagged<T> dict) {
   DisallowGarbageCollection no_gc;
   ReadOnlyRoots roots = GetReadOnlyRoots();
 
-  if (dict->Capacity() == 0) {
-    return;
-  }
+  if (dict->Capacity() == 0) return;
 
 #ifdef V8_ENABLE_SWISS_NAME_DICTIONARY
-  Isolate* isolate = GetIsolateFromWritableObject(dict);
+  Isolate* isolate = Isolate::Current();
   // IterateEntries for SwissNameDictionary needs to create a handle.
   HandleScope scope(isolate);
 #endif
@@ -255,6 +273,9 @@ void HeapObject::HeapObjectPrint(std::ostream& os) {
       break;
     case HASH_TABLE_TYPE:
       Cast<ObjectHashTable>(*this)->ObjectHashTablePrint(os);
+      break;
+    case DOUBLE_STRING_CACHE_TYPE:
+      Cast<DoubleStringCache>(*this)->DoubleStringCachePrint(os);
       break;
     case NAME_TO_INDEX_HASH_TABLE_TYPE:
       Cast<NameToIndexHashTable>(*this)->NameToIndexHashTablePrint(os);
@@ -377,6 +398,9 @@ void HeapObject::HeapObjectPrint(std::ostream& os) {
     case BIG_INT_BASE_TYPE:
       Cast<BigIntBase>(*this)->BigIntBasePrint(os);
       break;
+    case FREE_SPACE_TYPE:
+      Cast<FreeSpace>(*this)->FreeSpacePrint(os);
+      break;
     case JS_CLASS_CONSTRUCTOR_TYPE:
     case JS_PROMISE_CONSTRUCTOR_TYPE:
     case JS_REG_EXP_CONSTRUCTOR_TYPE:
@@ -455,7 +479,7 @@ void BytecodeArray::BytecodeArrayPrint(std::ostream& os) {
 
 void BytecodeWrapper::BytecodeWrapperPrint(std::ostream& os) {
   PrintHeader(os, "BytecodeWrapper");
-  IsolateForSandbox isolate = GetIsolateForSandbox(*this);
+  IsolateForSandbox isolate = GetCurrentIsolateForSandbox();
   os << "\n    bytecode: " << Brief(bytecode(isolate));
 }
 
@@ -465,7 +489,8 @@ void FreeSpace::FreeSpacePrint(std::ostream& os) {
 
 bool JSObject::PrintProperties(std::ostream& os) {
   if (HasFastProperties()) {
-    Tagged<DescriptorArray> descs = map()->instance_descriptors(GetIsolate());
+    Tagged<DescriptorArray> descs =
+        map()->instance_descriptors(Isolate::Current());
     int nof_inobject_properties = map()->GetInObjectProperties();
     for (InternalIndex i : map()->IterateOwnDescriptors()) {
       os << "\n    ";
@@ -607,6 +632,23 @@ void PrintTypedArrayElements(std::ostream& os, const ElementType* data_ptr,
     if (previous_index != i - 1) {
       ss << '-' << (i - 1);
     }
+#ifdef V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+    if constexpr (std::is_floating_point_v<ElementType>) {
+      if (std::isnan(previous_value)) {
+        os << std::setw(12) << ss.str() << ": " << +previous_value << " (0x"
+           << std::hex;
+        if constexpr (std::is_same_v<ElementType, float>) {
+          os << base::bit_cast<uint32_t>(previous_value);
+        } else {
+          os << base::bit_cast<uint64_t>(previous_value);
+        }
+        os << std::dec << ")";
+        previous_index = i;
+        previous_value = value;
+        continue;
+      }
+    }
+#endif  // V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
     os << std::setw(12) << ss.str() << ": " << +previous_value;
     previous_index = i;
     previous_value = value;
@@ -759,7 +801,7 @@ namespace {
 
 void JSObjectPrintHeader(std::ostream& os, Tagged<JSObject> obj,
                          const char* id) {
-  Isolate* isolate = obj->GetIsolate();
+  Isolate* isolate = Isolate::Current();
   obj->PrintHeader(os, id);
   // Don't call GetElementsKind, its validation code can cause the printer to
   // fail when debugging.
@@ -811,7 +853,7 @@ void JSObjectPrintBody(std::ostream& os, Tagged<JSObject> obj,
   }
   int embedder_fields = obj->GetEmbedderFieldCount();
   if (embedder_fields > 0) {
-    IsolateForSandbox isolate = GetIsolateForSandbox(obj);
+    IsolateForSandbox isolate = GetCurrentIsolateForSandbox();
     os << " - embedder fields = {";
     for (int i = 0; i < embedder_fields; i++) {
       os << "\n    ";
@@ -884,7 +926,7 @@ void JSGeneratorObject::JSGeneratorObjectPrint(std::ostream& os) {
       os << "\n - source position: ";
       // Can't collect source positions here if not available as that would
       // allocate memory.
-      Isolate* isolate = GetIsolate();
+      Isolate* isolate = Isolate::Current();
       if (fun_info->HasBytecodeArray() &&
           fun_info->GetBytecodeArray(isolate)->HasSourcePositionTable()) {
         os << source_position();
@@ -925,7 +967,7 @@ void JSPromise::JSPromisePrint(std::ostream& os) {
 
 void JSRegExp::JSRegExpPrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, "JSRegExp");
-  IsolateForSandbox isolate = GetIsolateForSandbox(*this);
+  IsolateForSandbox isolate = GetCurrentIsolateForSandbox();
   os << "\n - data: " << Brief(data(isolate));
   os << "\n - source: " << Brief(source());
   FlagsBuffer buffer;
@@ -959,7 +1001,7 @@ void AtomRegExpData::AtomRegExpDataPrint(std::ostream& os) {
 }
 
 void IrRegExpData::IrRegExpDataPrint(std::ostream& os) {
-  IsolateForSandbox isolate = GetIsolateForSandbox(*this);
+  IsolateForSandbox isolate = GetCurrentIsolateForSandbox();
   RegExpDataPrint(os);
   if (has_latin1_bytecode()) {
     os << "\n - latin1_bytecode: " << Brief(latin1_bytecode());
@@ -983,7 +1025,7 @@ void IrRegExpData::IrRegExpDataPrint(std::ostream& os) {
 
 void RegExpDataWrapper::RegExpDataWrapperPrint(std::ostream& os) {
   PrintHeader(os, "RegExpDataWrapper");
-  IsolateForSandbox isolate = GetIsolateForSandbox(*this);
+  IsolateForSandbox isolate = GetCurrentIsolateForSandbox();
   os << "\n    data: " << Brief(data(isolate));
   os << "\n";
 }
@@ -1109,7 +1151,7 @@ void ClassBoilerplate::ClassBoilerplatePrint(std::ostream& os) {
 
 void RegExpBoilerplateDescription::RegExpBoilerplateDescriptionPrint(
     std::ostream& os) {
-  IsolateForSandbox isolate = GetIsolateForSandbox(*this);
+  IsolateForSandbox isolate = GetCurrentIsolateForSandbox();
   PrintHeader(os, "RegExpBoilerplate");
   os << "\n - data: " << Brief(data(isolate));
   os << "\n - source: " << source();
@@ -1118,7 +1160,7 @@ void RegExpBoilerplateDescription::RegExpBoilerplateDescriptionPrint(
 }
 
 void EmbedderDataArray::EmbedderDataArrayPrint(std::ostream& os) {
-  IsolateForSandbox isolate = GetIsolateForSandbox(*this);
+  IsolateForSandbox isolate = GetCurrentIsolateForSandbox();
   PrintHeader(os, "EmbedderDataArray");
   os << "\n - length: " << length();
   EmbedderDataSlot start(*this, 0);
@@ -1312,32 +1354,30 @@ void FunctionTemplateInfo::FunctionTemplateInfoPrint(std::ostream& os) {
   os << '\n';
 }
 
-namespace {
-void PrintContextWithHeader(std::ostream& os, Tagged<Context> context,
-                            const char* type) {
-  context->PrintHeader(os, type);
-  os << "\n - type: " << context->map()->instance_type();
-  os << "\n - scope_info: " << Brief(context->scope_info());
-  os << "\n - previous: " << Brief(context->unchecked_previous());
-  os << "\n - native_context: " << Brief(context->native_context());
-  if (context->scope_info()->HasContextExtensionSlot()) {
-    os << "\n - extension: " << context->extension();
+void Context::PrintContextWithHeader(std::ostream& os, const char* type) {
+  PrintHeader(os, type);
+  os << "\n - type: " << map()->instance_type();
+  os << "\n - scope_info: " << Brief(scope_info());
+  os << "\n - previous: " << Brief(unchecked_previous());
+  os << "\n - native_context: " << Brief(native_context());
+  if (scope_info()->HasContextExtensionSlot()) {
+    os << "\n - extension: " << extension();
   }
-  os << "\n - length: " << context->length();
+  os << "\n - length: " << length();
   os << "\n - elements:";
   PrintFixedArrayElements<Context>(
-      os, context, context->length(),
-      [](Tagged<Context> xs, int i) { return Cast<Object>(xs->GetNoCell(i)); });
+      os, *this, length(), [](Tagged<Context> xs, int i) {
+        return Cast<Object>(xs->get(i, kRelaxedLoad));
+      });
   os << "\n";
 }
-}  // namespace
 
 void Context::ContextPrint(std::ostream& os) {
-  PrintContextWithHeader(os, *this, "Context");
+  PrintContextWithHeader(os, "Context");
 }
 
 void NativeContext::NativeContextPrint(std::ostream& os) {
-  PrintContextWithHeader(os, *this, "NativeContext");
+  PrintContextWithHeader(os, "NativeContext");
   os << " - microtask_queue: " << microtask_queue() << "\n";
 }
 
@@ -1676,11 +1716,24 @@ void FeedbackCell::FeedbackCellPrint(std::ostream& os) {
         TryCast(value(), &fbv) && fbv->tiering_in_progress()) {
       os << "in_progress ";
     }
-    jdt->PrintCurrentTieringRequest(dispatch_handle(),
-                                    GetIsolateFromWritableObject(*this), os);
+    jdt->PrintCurrentTieringRequest(dispatch_handle(), Isolate::Current(), os);
   }
 
 #endif  // V8_ENABLE_LEAPTIERING
+  os << "\n";
+}
+
+void DoubleStringCache::DoubleStringCachePrint(std::ostream& os) {
+  PrintHeader(os, "DoubleStringCache");
+  os << "\n - capacity: " << capacity();
+  for (InternalIndex entry_index : InternalIndex::Range(capacity())) {
+    auto& entry = entries()[entry_index.as_uint32()];
+    if (entry.value_.load() == kEmptySentinel) continue;
+
+    os << "\n       [" << entry_index.as_uint32() << "]: ";
+    PrintDouble(os, entry.key_.value());
+    os << " - " << Brief(entry.value_.load());
+  }
   os << "\n";
 }
 
@@ -1714,7 +1767,8 @@ void FeedbackMetadata::FeedbackMetadataPrint(std::ostream& os) {
   os << "\n - slot_count: " << slot_count();
   os << "\n - create_closure_slot_count: " << create_closure_slot_count();
 
-  FeedbackMetadataIterator iter(*this);
+  DisallowGarbageCollection no_gc;
+  FeedbackMetadataIterator iter(*this, no_gc);
   while (iter.HasNext()) {
     FeedbackSlot slot = iter.Next();
     FeedbackSlotKind kind = iter.kind();
@@ -1746,7 +1800,7 @@ void FeedbackVector::FeedbackVectorPrint(std::ostream& os) {
   os << "\n - tiering state: " << tiering_state();
   if (has_optimized_code()) {
     os << "\n - optimized code: "
-       << Brief(optimized_code(GetIsolateForSandbox(*this)));
+       << Brief(optimized_code(GetCurrentIsolateForSandbox()));
   } else {
     os << "\n - no optimized code";
   }
@@ -1758,7 +1812,8 @@ void FeedbackVector::FeedbackVectorPrint(std::ostream& os) {
   os << "\n - closure feedback cell array: ";
   closure_feedback_cell_array()->ClosureFeedbackCellArrayPrint(os);
 
-  FeedbackMetadataIterator iter(metadata());
+  DisallowGarbageCollection no_gc;
+  FeedbackMetadataIterator iter(metadata(), no_gc);
   while (iter.HasNext()) {
     FeedbackSlot slot = iter.Next();
     FeedbackSlotKind kind = iter.kind();
@@ -1779,7 +1834,7 @@ void FeedbackVector::FeedbackVectorPrint(std::ostream& os) {
 }
 
 void FeedbackVector::FeedbackSlotPrint(std::ostream& os, FeedbackSlot slot) {
-  FeedbackNexus nexus(GetIsolate(), *this, slot);
+  FeedbackNexus nexus(Isolate::Current(), *this, slot);
   nexus.Print(os);
 }
 
@@ -1832,7 +1887,7 @@ void FeedbackNexus::Print(std::ostream& os) {
       if (ic_state() == InlineCacheState::MONOMORPHIC) {
         os << "\n   " << Brief(GetFeedback()) << ": ";
         if (GetFeedbackExtra().IsCleared()) {
-          os << " <cleared>\n";
+          os << " [cleared]\n";
           break;
         }
         Tagged<Object> handler = GetFeedbackExtra().GetHeapObjectOrSmi();
@@ -1852,7 +1907,12 @@ void FeedbackNexus::Print(std::ostream& os) {
         }
         for (int i = 0; i < array->length(); i += 2) {
           os << "\n   " << Brief(array->get(i)) << ": ";
-          LoadHandler::PrintHandler(array->get(i + 1).GetHeapObjectOrSmi(), os);
+          if (!array->get(i + 1).IsCleared()) {
+            LoadHandler::PrintHandler(array->get(i + 1).GetHeapObjectOrSmi(),
+                                      os);
+          } else {
+            os << "[cleared]\n";
+          }
         }
       }
       break;
@@ -2039,6 +2099,9 @@ static const char* const weekdays[] = {"???", "Sun", "Mon", "Tue",
 void JSDate::JSDatePrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, "JSDate");
   os << "\n - value: " << value();
+  os << "\n - cache_stamp: " << cache_stamp()
+     << " (vs. Isolate::date_time_stamp: "
+     << Brief(Isolate::Current()->date_cache_stamp()) << ")";
   if (!IsSmi(year())) {
     os << "\n - time = NaN\n";
   } else {
@@ -2125,24 +2188,18 @@ void JSFinalizationRegistry::JSFinalizationRegistryPrint(std::ostream& os) {
 
 void JSSharedArray::JSSharedArrayPrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, "JSSharedArray");
-  Isolate* isolate = GetIsolateFromWritableObject(*this);
-  os << "\n - isolate: " << isolate;
   if (HeapLayout::InWritableSharedSpace(*this)) os << " (shared)";
   JSObjectPrintBody(os, *this);
 }
 
 void JSSharedStruct::JSSharedStructPrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, "JSSharedStruct");
-  Isolate* isolate = GetIsolateFromWritableObject(*this);
-  os << "\n - isolate: " << isolate;
   if (HeapLayout::InWritableSharedSpace(*this)) os << " (shared)";
   JSObjectPrintBody(os, *this);
 }
 
 void JSAtomicsMutex::JSAtomicsMutexPrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, "JSAtomicsMutex");
-  Isolate* isolate = GetIsolateFromWritableObject(*this);
-  os << "\n - isolate: " << isolate;
   if (HeapLayout::InWritableSharedSpace(*this)) os << " (shared)";
   os << "\n - state: " << this->state();
   os << "\n - owner_thread_id: " << this->owner_thread_id();
@@ -2151,8 +2208,6 @@ void JSAtomicsMutex::JSAtomicsMutexPrint(std::ostream& os) {
 
 void JSAtomicsCondition::JSAtomicsConditionPrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, "JSAtomicsCondition");
-  Isolate* isolate = GetIsolateFromWritableObject(*this);
-  os << "\n - isolate: " << isolate;
   if (HeapLayout::InWritableSharedSpace(*this)) os << " (shared)";
   os << "\n - state: " << this->state();
   JSObjectPrintBody(os, *this);
@@ -2252,7 +2307,7 @@ void JSWeakSet::JSWeakSetPrint(std::ostream& os) {
 void JSArrayBuffer::JSArrayBufferPrint(std::ostream& os) {
   JSAPIObjectWithEmbedderSlotsPrintHeader(os, *this, "JSArrayBuffer");
   os << "\n - backing_store: " << backing_store();
-  os << "\n - byte_length: " << byte_length();
+  os << "\n - byte_length: " << GetByteLength();
   os << "\n - max_byte_length: " << max_byte_length();
   os << "\n - detach key: " << detach_key();
   if (is_external()) os << "\n - external";
@@ -2330,7 +2385,7 @@ void JSBoundFunction::JSBoundFunctionPrint(std::ostream& os) {
 }
 
 void JSFunction::JSFunctionPrint(std::ostream& os) {
-  Isolate* isolate = GetIsolate();
+  Isolate* isolate = Isolate::Current();
   JSObjectPrintHeader(os, *this, "Function");
   os << "\n - function prototype: ";
   if (has_prototype_slot()) {
@@ -2378,7 +2433,7 @@ void JSFunction::JSFunctionPrint(std::ostream& os) {
       os << "in_progress ";
     }
     IsolateGroup::current()->js_dispatch_table()->PrintCurrentTieringRequest(
-        dispatch_handle(), GetIsolate(), os);
+        dispatch_handle(), Isolate::Current(), os);
   }
 
 #endif  // V8_ENABLE_LEAPTIERING
@@ -2465,7 +2520,7 @@ void SharedFunctionInfo::SharedFunctionInfoPrint(std::ostream& os) {
   os << "\n - language_mode: " << language_mode();
   if (HasTrustedData()) {
     os << "\n - trusted_function_data: "
-       << Brief(GetTrustedData(GetIsolateForSandbox(*this)));
+       << Brief(GetTrustedData(GetCurrentIsolateForSandbox()));
   } else {
     os << "\n - trusted_function_data: <empty>";
   }
@@ -2494,7 +2549,7 @@ void SharedFunctionInfo::SharedFunctionInfoPrint(std::ostream& os) {
   } else {
     os << "<none>";
   }
-  os << "\n - function_literal_id: " << function_literal_id();
+  os << "\n - function_literal_id: " << function_literal_id(kRelaxedLoad);
   os << "\n - unique_id: " << unique_id();
   os << "\n - age: " << age();
   os << "\n";
@@ -2504,6 +2559,13 @@ void SharedFunctionInfoWrapper::SharedFunctionInfoWrapperPrint(
     std::ostream& os) {
   PrintHeader(os, "SharedFunctionInfoWrapper");
   os << "\n    sfi: " << Brief(shared_info());
+}
+
+void InterpreterData::InterpreterDataPrint(std::ostream& os) {
+  PrintHeader(os, "InterpreterData");
+  os << "\n - bytecode_array: " << Brief(bytecode_array());
+  os << "\n - interpreter_trampoline: " << Brief(interpreter_trampoline());
+  os << "\n";
 }
 
 void JSGlobalProxy::JSGlobalProxyPrint(std::ostream& os) {
@@ -2581,6 +2643,10 @@ void Code::CodePrint(std::ostream& os, const char* name, Address current_pc) {
        << Brief(istream->relocation_info());
     os << "\n - instruction_stream.body_size: " << istream->body_size();
   }
+#ifdef V8_ENABLE_LEAPTIERING
+  os << "\n - dispatch_handle: 0x" << std::hex << js_dispatch_handle()
+     << std::dec;
+#endif  // V8_ENABLE_LEAPTIERING
   os << "\n";
 
   // Finally, the disassembly:
@@ -2673,6 +2739,11 @@ void PrototypeInfo::PrototypeInfoPrint(std::ostream& os) {
   os << "\n - registry slot: " << registry_slot();
   os << "\n - derived maps: " << Brief(derived_maps());
   os << "\n - should_be_fast_map: " << should_be_fast_map();
+  os << "\n - prototype_chain_enum_cache: "
+     << Brief(prototype_chain_enum_cache());
+  for (int i = 0; i < PrototypeInfo::kCachedHandlerCount; i++) {
+    os << "\n - cached_handler[" << i << "]: " << Brief(cached_handler(i));
+  }
   os << "\n";
 }
 
@@ -2709,7 +2780,7 @@ void WasmStruct::WasmStructPrint(std::ostream& os) {
       wasm::GetTypeCanonicalizer()->LookupStruct(
           map()->wasm_type_info()->type_index());
   if (struct_type->is_descriptor()) {
-    os << "\n - describes RTT: " << Brief(get_described_rtt());
+    os << "\n - describes RTT: " << Brief(described_rtt());
   }
   os << "\n - fields (" << struct_type->field_count() << "):";
   for (uint32_t i = 0; i < struct_type->field_count(); i++) {
@@ -2855,7 +2926,12 @@ void WasmArray::WasmArrayPrint(std::ostream& os) {
 void WasmSuspenderObject::WasmSuspenderObjectPrint(std::ostream& os) {
   PrintHeader(os, "WasmSuspenderObject");
   os << "\n - stack: " << (stack() == nullptr ? -1 : stack()->id());
-  os << "\n - parent: " << parent();
+  os << "\n - parent: ";
+  if (has_parent()) {
+    os << Brief(parent());
+  } else {
+    os << "<empty>";
+  }
   os << "\n - promise: " << promise();
   os << "\n - resume: " << resume();
   os << "\n - reject: " << reject();
@@ -2868,8 +2944,14 @@ void WasmSuspendingObject::WasmSuspendingObjectPrint(std::ostream& os) {
   os << "\n";
 }
 
+void WasmContinuationObject::WasmContinuationObjectPrint(std::ostream& os) {
+  PrintHeader(os, "WasmContinuationObject");
+  os << "\n - stack: " << (stack() == nullptr ? -1 : stack()->id());
+  os << "\n";
+}
+
 void WasmInstanceObject::WasmInstanceObjectPrint(std::ostream& os) {
-  IsolateForSandbox isolate = GetIsolateForSandbox(*this);
+  IsolateForSandbox isolate = GetCurrentIsolateForSandbox();
   JSObjectPrintHeader(os, *this, "WasmInstanceObject");
   os << "\n - trusted_data: " << Brief(trusted_data(isolate));
   os << "\n - module_object: " << Brief(module_object());
@@ -2955,7 +3037,7 @@ void WasmDispatchTable::WasmDispatchTablePrint(std::ostream& os) {
 
 // Never called directly, as WasmFunctionData is an "abstract" class.
 void WasmFunctionData::WasmFunctionDataPrint(std::ostream& os) {
-  IsolateForSandbox isolate = GetIsolateForSandbox(*this);
+  IsolateForSandbox isolate = GetCurrentIsolateForSandbox();
   os << "\n - func_ref: " << Brief(func_ref());
   os << "\n - internal: " << Brief(internal());
   os << "\n - wrapper_code: " << Brief(wrapper_code(isolate));
@@ -2968,8 +3050,10 @@ void WasmExportedFunctionData::WasmExportedFunctionDataPrint(std::ostream& os) {
   WasmFunctionDataPrint(os);
   os << "\n - instance_data: " << Brief(instance_data());
   os << "\n - function_index: " << function_index();
-  os << "\n - signature: " << reinterpret_cast<const void*>(sig());
   os << "\n - wrapper_budget: " << wrapper_budget()->value();
+  os << "\n - canonical_type_index: " << canonical_type_index();
+  os << "\n - receiver_is_first_param: " << receiver_is_first_param();
+  os << "\n - signature: " << reinterpret_cast<const void*>(sig());
   os << "\n";
 }
 
@@ -2982,7 +3066,9 @@ void WasmJSFunctionData::WasmJSFunctionDataPrint(std::ostream& os) {
 
 void WasmResumeData::WasmResumeDataPrint(std::ostream& os) {
   PrintHeader(os, "WasmResumeData");
-  os << "\n - suspender: " << Brief(suspender());
+  IsolateForSandbox isolate = GetCurrentIsolateForSandbox();
+  os << "\n - suspender: " << Brief(trusted_suspender(isolate));
+  os << "\n - on_resume: " << on_resume();
   os << '\n';
 }
 
@@ -2997,7 +3083,7 @@ void WasmImportData::WasmImportDataPrint(std::ostream& os) {
     os << "<empty>";
   }
   os << "\n - suspend: " << static_cast<int>(suspend());
-  os << "\n - wrapper_budget: " << wrapper_budget();
+  os << "\n - wrapper_budget: " << wrapper_budget()->value();
   if (has_call_origin()) {
     os << "\n - call_origin: " << Brief(call_origin());
   }
@@ -3008,17 +3094,18 @@ void WasmImportData::WasmImportDataPrint(std::ostream& os) {
 
 void WasmInternalFunction::WasmInternalFunctionPrint(std::ostream& os) {
   PrintHeader(os, "WasmInternalFunction");
-  os << "\n - call target: "
-     << wasm::GetProcessWideWasmCodePointerTable()
-            ->GetEntrypointWithoutSignatureCheck(call_target());
   os << "\n - implicit arg: " << Brief(implicit_arg());
   os << "\n - external: " << Brief(external());
+  os << "\n - function_index: " << function_index();
+  os << "\n - call target: [" << call_target().value() << "] -> "
+     << AsHex::Address(wasm::GetProcessWideWasmCodePointerTable()
+                           ->GetEntrypointWithoutSignatureCheck(call_target()));
   os << "\n";
 }
 
 void WasmFuncRef::WasmFuncRefPrint(std::ostream& os) {
   PrintHeader(os, "WasmFuncRef");
-  IsolateForSandbox isolate = GetIsolateForSandbox(*this);
+  IsolateForSandbox isolate = GetCurrentIsolateForSandbox();
   os << "\n - internal: " << Brief(internal(isolate));
   os << "\n";
 }
@@ -3045,7 +3132,7 @@ void WasmDescriptorOptions::WasmDescriptorOptionsPrint(std::ostream& os) {
 
 void WasmModuleObject::WasmModuleObjectPrint(std::ostream& os) {
   PrintHeader(os, "WasmModuleObject");
-  os << "\n - module: " << module();
+  os << "\n - module: " << native_module()->module();
   os << "\n - native module: " << native_module();
   os << "\n - script: " << Brief(script());
   os << "\n";
@@ -3208,6 +3295,7 @@ void Script::ScriptPrint(std::ostream& os) {
   os << "\n";
 }
 
+#ifdef V8_TEMPORAL_SUPPORT
 void JSTemporalPlainDate::JSTemporalPlainDatePrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, "JSTemporalPlainDate");
   JSObjectPrintBody(os, *this);
@@ -3248,15 +3336,7 @@ void JSTemporalPlainMonthDay::JSTemporalPlainMonthDayPrint(std::ostream& os) {
   JSObjectPrintBody(os, *this);
 }
 
-void JSTemporalTimeZone::JSTemporalTimeZonePrint(std::ostream& os) {
-  JSObjectPrintHeader(os, *this, "JSTemporalTimeZone");
-  JSObjectPrintBody(os, *this);
-}
-
-void JSTemporalCalendar::JSTemporalCalendarPrint(std::ostream& os) {
-  JSObjectPrintHeader(os, *this, "JSTemporalCalendar");
-  JSObjectPrintBody(os, *this);
-}
+#endif  // V8_TEMPORAL_SUPPORT
 
 void JSRawJson::JSRawJsonPrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, "JSRawJson");
@@ -3291,15 +3371,15 @@ void JSDateTimeFormat::JSDateTimeFormatPrint(std::ostream& os) {
   os << "\n - icu simple date format: " << Brief(icu_simple_date_format());
   os << "\n - icu date interval format: " << Brief(icu_date_interval_format());
   os << "\n - bound format: " << Brief(bound_format());
-  os << "\n - hour cycle: " << HourCycleAsString(GetIsolate());
+  os << "\n - hour cycle: " << HourCycleAsString(Isolate::Current());
   JSObjectPrintBody(os, *this);
 }
 
 void JSDisplayNames::JSDisplayNamesPrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, "JSDisplayNames");
   os << "\n - internal: " << Brief(internal());
-  os << "\n - style: " << StyleAsString(GetIsolate());
-  os << "\n - fallback: " << FallbackAsString(GetIsolate());
+  os << "\n - style: " << StyleAsString(Isolate::Current());
+  os << "\n - fallback: " << FallbackAsString(Isolate::Current());
   JSObjectPrintBody(os, *this);
 }
 
@@ -3315,8 +3395,8 @@ void JSDurationFormat::JSDurationFormatPrint(std::ostream& os) {
 void JSListFormat::JSListFormatPrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, "JSListFormat");
   os << "\n - locale: " << Brief(locale());
-  os << "\n - style: " << StyleAsString(GetIsolate());
-  os << "\n - type: " << TypeAsString(GetIsolate());
+  os << "\n - style: " << StyleAsString(Isolate::Current());
+  os << "\n - type: " << TypeAsString(Isolate::Current());
   os << "\n - icu formatter: " << Brief(icu_formatter());
   JSObjectPrintBody(os, *this);
 }
@@ -3338,7 +3418,7 @@ void JSNumberFormat::JSNumberFormatPrint(std::ostream& os) {
 void JSPluralRules::JSPluralRulesPrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, "JSPluralRules");
   os << "\n - locale: " << Brief(locale());
-  os << "\n - type: " << TypeAsString(GetIsolate());
+  os << "\n - type: " << TypeAsString(Isolate::Current());
   os << "\n - icu plural rules: " << Brief(icu_plural_rules());
   os << "\n - icu_number_formatter: " << Brief(icu_number_formatter());
   JSObjectPrintBody(os, *this);
@@ -3348,7 +3428,7 @@ void JSRelativeTimeFormat::JSRelativeTimeFormatPrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, "JSRelativeTimeFormat");
   os << "\n - locale: " << Brief(locale());
   os << "\n - numberingSystem: " << Brief(numberingSystem());
-  os << "\n - numeric: " << NumericAsString(GetIsolate());
+  os << "\n - numeric: " << NumericAsString(Isolate::Current());
   os << "\n - icu formatter: " << Brief(icu_formatter());
   os << "\n";
 }
@@ -3356,14 +3436,14 @@ void JSRelativeTimeFormat::JSRelativeTimeFormatPrint(std::ostream& os) {
 void JSSegmentIterator::JSSegmentIteratorPrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, "JSSegmentIterator");
   os << "\n - icu break iterator: " << Brief(icu_break_iterator());
-  os << "\n - granularity: " << GranularityAsString(GetIsolate());
+  os << "\n - granularity: " << GranularityAsString(Isolate::Current());
   os << "\n";
 }
 
 void JSSegmenter::JSSegmenterPrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, "JSSegmenter");
   os << "\n - locale: " << Brief(locale());
-  os << "\n - granularity: " << GranularityAsString(GetIsolate());
+  os << "\n - granularity: " << GranularityAsString(Isolate::Current());
   os << "\n - icu break iterator: " << Brief(icu_break_iterator());
   JSObjectPrintBody(os, *this);
 }
@@ -3372,7 +3452,7 @@ void JSSegments::JSSegmentsPrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, "JSSegments");
   os << "\n - icu break iterator: " << Brief(icu_break_iterator());
   os << "\n - unicode string: " << Brief(unicode_string());
-  os << "\n - granularity: " << GranularityAsString(GetIsolate());
+  os << "\n - granularity: " << GranularityAsString(Isolate::Current());
   JSObjectPrintBody(os, *this);
 }
 #endif  // V8_INTL_SUPPORT
@@ -3460,15 +3540,55 @@ void PreparseData::PreparseDataPrint(std::ostream& os) {
   os << "\n - data_length: " << data_length();
   os << "\n - children_length: " << children_length();
   if (data_length() > 0) {
-    os << "\n - data-start: " << (address() + kDataStartOffset);
+    os << "\n - data-start: " << reinterpret_cast<Address>(data());
   }
   if (children_length() > 0) {
-    os << "\n - children-start: " << inner_start_offset();
+    os << "\n - children-start: " << reinterpret_cast<Address>(children());
   }
   for (int i = 0; i < children_length(); ++i) {
     os << "\n - [" << i << "]: " << Brief(get_child(i));
   }
   os << "\n";
+}
+
+void UncompiledDataWithoutPreparseData::UncompiledDataWithoutPreparseDataPrint(
+    std::ostream& os) {
+  PrintHeader(os, "UncompiledDataWithoutPreparseData");
+  os << "\n - inferred_name: " << Brief(inferred_name());
+  os << "\n - start_position: " << start_position();
+  os << "\n - end_position: " << end_position();
+  os << '\n';
+}
+
+void UncompiledDataWithPreparseData::UncompiledDataWithPreparseDataPrint(
+    std::ostream& os) {
+  PrintHeader(os, "UncompiledDataWithPreparseData");
+  os << "\n - inferred_name: " << Brief(inferred_name());
+  os << "\n - start_position: " << start_position();
+  os << "\n - end_position: " << end_position();
+  os << "\n - preparse_data: " << Brief(preparse_data());
+  os << '\n';
+}
+
+void UncompiledDataWithoutPreparseDataWithJob::
+    UncompiledDataWithoutPreparseDataWithJobPrint(std::ostream& os) {
+  PrintHeader(os, "UncompiledDataWithoutPreparseDataWithJob");
+  os << "\n - inferred_name: " << Brief(inferred_name());
+  os << "\n - start_position: " << start_position();
+  os << "\n - end_position: " << end_position();
+  os << "\n - job: " << job();
+  os << '\n';
+}
+
+void UncompiledDataWithPreparseDataAndJob::
+    UncompiledDataWithPreparseDataAndJobPrint(std::ostream& os) {
+  PrintHeader(os, "UncompiledDataWithPreparseDataAndJob");
+  os << "\n - inferred_name: " << Brief(inferred_name());
+  os << "\n - start_position: " << start_position();
+  os << "\n - end_position: " << end_position();
+  os << "\n - preparse_data: " << Brief(preparse_data());
+  os << "\n - job: " << job();
+  os << '\n';
 }
 
 void HeapNumber::HeapNumberPrint(std::ostream& os) {
@@ -3833,7 +3953,7 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
       os << "<Cell value= ";
       HeapStringAllocator allocator;
       StringStream accumulator(&allocator);
-      ShortPrint(Cast<Cell>(*this)->value(), &accumulator);
+      ShortPrint(Cast<Cell>(*this)->maybe_value(), &accumulator);
       os << accumulator.ToCString().get();
       os << '>';
       break;
@@ -3889,18 +4009,7 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
 }
 
 void HeapNumber::HeapNumberShortPrint(std::ostream& os) {
-  double val = value();
-  if (i::IsMinusZero(val)) {
-    os << "-0.0";
-  } else if (val == DoubleToInteger(val) && val >= kMinSafeInteger &&
-             val <= kMaxSafeInteger) {
-    // Print integer HeapNumbers in safe integer range with max precision: as
-    // 9007199254740991.0 instead of 9.0072e+15
-    int64_t i = static_cast<int64_t>(val);
-    os << i << ".0";
-  } else {
-    os << val;
-  }
+  PrintDouble(os, value());
 }
 
 // TODO(cbruni): remove once the new maptracer is in place.
@@ -4009,7 +4118,7 @@ void Map::MapPrint(std::ostream& os) {
   } else {
     os << "\n - back pointer: " << Brief(GetBackPointer());
   }
-  os << "\n - prototype_validity cell: "
+  os << "\n - prototype_validity_cell: "
      << Brief(prototype_validity_cell(kRelaxedLoad));
   os << "\n - instance descriptors " << (owns_descriptors() ? "(own) " : "")
      << "#" << NumberOfOwnDescriptors() << ": "
@@ -4020,7 +4129,7 @@ void Map::MapPrint(std::ostream& os) {
   if (!HeapLayout::InReadOnlySpace(*this)) {
     Isolate* isolate = HeapLayout::InWritableSharedSpace(*this)
                            ? Isolate::Current()->shared_space_isolate()
-                           : GetIsolateFromWritableObject(*this);
+                           : Isolate::Current();
     TransitionsAccessor transitions(isolate, *this);
     int nof_transitions = transitions.NumberOfTransitions();
     if (nof_transitions > 0 || transitions.HasPrototypeTransitions() ||
@@ -4139,13 +4248,14 @@ void TransitionsAccessor::PrintOneTransition(std::ostream& os, Tagged<Name> key,
 }
 
 void TransitionArray::PrintInternal(std::ostream& os) {
+  Isolate* isolate = Isolate::Current();
   {
     int num_transitions = number_of_transitions();
     os << "\n   Transitions #" << num_transitions << ":";
     for (int i = 0; i < num_transitions; i++) {
       Tagged<Name> key = GetKey(i);
       Tagged<Map> target;
-      GetTargetIfExists(i, GetIsolateFromWritableObject(*this), &target);
+      GetTargetIfExists(i, isolate, &target);
       TransitionsAccessor::PrintOneTransition(os, key, target);
     }
   }
@@ -4273,7 +4383,7 @@ void TransitionsAccessor::PrintTransitionTree(
 }
 
 void JSObject::PrintTransitions(std::ostream& os) {
-  TransitionsAccessor ta(GetIsolate(), map());
+  TransitionsAccessor ta(Isolate::Current(), map());
   if (ta.NumberOfTransitions() != 0 || ta.HasPrototypeTransitions()) {
     os << "\n - transitions";
     ta.PrintTransitions(os);

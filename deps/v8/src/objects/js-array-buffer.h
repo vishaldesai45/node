@@ -332,9 +332,6 @@ class JSTypedArray
   static constexpr size_t kMaxByteLength = JSArrayBuffer::kMaxByteLength;
   static_assert(kMaxByteLength == v8::TypedArray::kMaxByteLength);
 
-  // [length]: length of typed array in elements.
-  DECL_PRIMITIVE_GETTER(length, size_t)
-
   DECL_GETTER(base_pointer, Tagged<Object>)
   DECL_ACQUIRE_GETTER(base_pointer, Tagged<Object>)
 
@@ -346,7 +343,7 @@ class JSTypedArray
   ExternalArrayType type();
   V8_EXPORT_PRIVATE size_t element_size() const;
 
-  V8_EXPORT_PRIVATE Handle<JSArrayBuffer> GetBuffer();
+  V8_EXPORT_PRIVATE Handle<JSArrayBuffer> GetBuffer(Isolate* isolate);
 
   // The `DataPtr` is `base_ptr + external_pointer`, and `base_ptr` is nullptr
   // for off-heap typed arrays.
@@ -439,10 +436,6 @@ class JSTypedArray
   friend class Factory;
 
   DECL_PRIMITIVE_SETTER(length, size_t)
-  // Reads the "length" field, doesn't assert the TypedArray is not RAB / GSAB
-  // backed.
-  inline size_t LengthUnchecked() const;
-
   DECL_GETTER(external_pointer, Address)
 
   DECL_SETTER(base_pointer, Tagged<Object>)

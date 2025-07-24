@@ -1575,7 +1575,7 @@ void BytecodeGenerator::AllocateDeferredConstants(IsolateT* isolate,
   for (std::pair<NativeFunctionLiteral*, size_t> literal :
        native_function_literals_) {
     // This should only happen for main-thread compilations.
-    DCHECK((std::is_same<Isolate, v8::internal::Isolate>::value));
+    DCHECK((std::is_same_v<Isolate, v8::internal::Isolate>));
 
     NativeFunctionLiteral* expr = literal.first;
     v8::Isolate* v8_isolate = reinterpret_cast<v8::Isolate*>(isolate);
@@ -1594,8 +1594,15 @@ void BytecodeGenerator::AllocateDeferredConstants(IsolateT* isolate,
   }
 
   for (std::pair<Call*, Scope*> call : eval_calls_) {
-    script->infos()->set(call.first->eval_scope_info_index(),
-                         MakeWeak(*call.second->scope_info()));
+    Tagged<ScopeInfo> current;
+    int index = call.first->eval_scope_info_index();
+    if (script->infos()->get(index).GetHeapObjectIfWeak(&current) &&
+        v8_flags.reuse_scope_infos) {
+      CHECK_EQ(current, *call.second->scope_info());
+    } else {
+      script->infos()->set(call.first->eval_scope_info_index(),
+                           MakeWeak(*call.second->scope_info()));
+    }
   }
 
   // Build object literal constant properties
@@ -1715,7 +1722,15 @@ void BytecodeGenerator::GenerateBytecodeBody() {
       GenerateAsyncFunctionBody();
     }
   } else {
-    GenerateBodyStatements();
+    int start = 0;
+    if (BuildInitializationBlockForParametersIfExist()) {
+      start = 1;
+    }
+    if (IsResumableFunction(info()->literal()->kind())) {
+      BuildGeneratorObjectVariableInitialization();
+    }
+
+    GenerateBodyStatements(start);
   }
 }
 
@@ -1735,13 +1750,7 @@ void BytecodeGenerator::GenerateBodyPrologue() {
   // Build assignment to {new.target} variable if it is used.
   VisitNewTargetVariable(closure_scope()->new_target_var());
 
-  // Create a generator object if necessary and initialize the
-  // {.generator_object} variable.
   FunctionLiteral* literal = info()->literal();
-  if (IsResumableFunction(literal->kind())) {
-    BuildGeneratorObjectVariableInitialization();
-  }
-
   // Emit tracing call if requested to do so.
   if (v8_flags.trace) builder()->CallRuntime(Runtime::kTraceEnter);
 
@@ -1861,6 +1870,7 @@ void BytecodeGenerator::GenerateAsyncFunctionBody() {
   // }
 
   FunctionLiteral* literal = info()->literal();
+  BuildGeneratorObjectVariableInitialization();
 
   HandlerTable::CatchPrediction outer_catch_prediction = catch_prediction();
   // When compiling a REPL script, use UNCAUGHT_ASYNC_AWAIT to preserve the
@@ -1888,6 +1898,19 @@ void BytecodeGenerator::GenerateAsyncFunctionBody() {
         BuildReturn(kNoSourcePosition);
       },
       catch_prediction());
+}
+
+bool BytecodeGenerator::BuildInitializationBlockForParametersIfExist() {
+  ZonePtrList<Statement>* body = info()->literal()->body();
+  if (body->length() > 0 && body->at(0)->IsBlock()) {
+    Block* block = body->at(0)->AsBlock();
+    if (block->is_initialization_block_for_parameters()) {
+      RegisterAllocationScope allocation_scope(this);
+      VisitBlockDeclarationsAndStatements(block);
+      return true;
+    }
+  }
+  return false;
 }
 
 void BytecodeGenerator::GenerateAsyncGeneratorFunctionBody() {
@@ -1920,15 +1943,10 @@ void BytecodeGenerator::GenerateAsyncGeneratorFunctionBody() {
   // in the following try-finally. We visit this block outside the try-finally
   // and remove it from the AST.
   int start = 0;
-  ZonePtrList<Statement>* statements = info()->literal()->body();
-  Statement* stmt = statements->at(0);
-  if (stmt->IsBlock()) {
-    Block* block = static_cast<Block*>(statements->at(0));
-    if (block->is_initialization_block_for_parameters()) {
-      VisitBlockDeclarationsAndStatements(block);
-      start = 1;
-    }
+  if (BuildInitializationBlockForParametersIfExist()) {
+    start = 1;
   }
+  BuildGeneratorObjectVariableInitialization();
 
   BuildTryFinally(
       [&]() {
@@ -3067,7 +3085,8 @@ void BytecodeGenerator::VisitForInStatement(ForInStatement* stmt) {
                              feedback_spec());
     LoopScope loop_scope(this, &loop_builder);
     HoleCheckElisionScope elider(this);
-    builder()->SetExpressionAsStatementPosition(stmt->each());
+    builder()->SetExpressionAsStatementPosition(stmt->each(),
+                                                /*is_breakable= */ false);
     loop_builder.BreakIfForInDone(index, cache_length);
     builder()->ForInNext(receiver, index, triple.Truncate(2),
                          feedback_index(slot));
@@ -3078,6 +3097,7 @@ void BytecodeGenerator::VisitForInStatement(ForInStatement* stmt) {
       EffectResultScope scope(this);
       // Make sure to preserve the accumulator across the PrepareAssignmentLhs
       // call.
+      builder()->SetExpressionAsStatementPosition(stmt->each());
       AssignmentLhsData lhs_data = PrepareAssignmentLhs(
           stmt->each(), AccumulatorPreservingMode::kPreserve);
       builder()->SetExpressionPosition(stmt->each());
@@ -3157,26 +3177,36 @@ void BytecodeGenerator::VisitForOfStatement(ForOfStatement* stmt) {
           // Call the iterator's .next() method. Break from the loop if the
           // `done` property is truthy, otherwise load the value from the
           // iterator result and append the argument.
-          builder()->SetExpressionAsStatementPosition(stmt->each());
-          BuildIteratorNext(iterator, next_result);
-          builder()->LoadNamedProperty(
-              next_result, ast_string_constants()->done_string(),
-              feedback_index(feedback_spec()->AddLoadICSlot()));
-          loop_builder.BreakIfTrue(ToBooleanMode::kConvertToBoolean);
+          builder()->SetExpressionAsStatementPosition(stmt->each(),
+                                                      /* is_breakable */ false);
+          if (v8_flags.for_of_optimization) {
+            builder()->ForOfNext(iterator.object(), iterator.next(),
+                                 next_result);
+            // TODO(rezvan): Perform ToBoolean conversion inside ForOfNext.
+            loop_builder.BreakIfTrue(ToBooleanMode::kConvertToBoolean);
 
-          builder()
-              // value = value.value
-              ->LoadNamedProperty(
-                  next_result, ast_string_constants()->value_string(),
-                  feedback_index(feedback_spec()->AddLoadICSlot()));
-          // done = false, before the assignment to each happens, so that done
-          // is false if the assignment throws.
-          builder()
-              ->StoreAccumulatorInRegister(next_result)
-              .LoadFalse()
-              .StoreAccumulatorInRegister(done);
+          } else {
+            BuildIteratorNext(iterator, next_result);
+            builder()->LoadNamedProperty(
+                next_result, ast_string_constants()->done_string(),
+                feedback_index(feedback_spec()->AddLoadICSlot()));
+            loop_builder.BreakIfTrue(ToBooleanMode::kConvertToBoolean);
+
+            builder()
+                // value = value.value
+                ->LoadNamedProperty(
+                    next_result, ast_string_constants()->value_string(),
+                    feedback_index(feedback_spec()->AddLoadICSlot()));
+            // done = false, before the assignment to each happens, so that done
+            // is false if the assignment throws.
+            builder()
+                ->StoreAccumulatorInRegister(next_result)
+                .LoadFalse()
+                .StoreAccumulatorInRegister(done);
+          }
 
           // Assign to the 'each' target.
+          builder()->SetExpressionAsStatementPosition(stmt->each());
           AssignmentLhsData lhs_data = PrepareAssignmentLhs(stmt->each());
           builder()->LoadAccumulatorWithRegister(next_result);
           BuildAssignment(lhs_data, Token::kAssign,
@@ -3253,8 +3283,7 @@ void BytecodeGenerator::VisitFunctionLiteral(FunctionLiteral* expr) {
            expr->function_literal_id());
   DCHECK_EQ(expr->scope()->outer_scope(), current_scope());
   uint8_t flags = CreateClosureFlags::Encode(
-      expr->pretenure(), closure_scope()->is_function_scope(),
-      info()->flags().might_always_turbofan());
+      expr->pretenure(), closure_scope()->is_function_scope());
   size_t entry = builder()->AllocateDeferredConstantPoolEntry();
   builder()->CreateClosure(entry, GetCachedCreateClosureSlot(expr), flags);
   function_literals_.push_back(std::make_pair(expr, entry));
@@ -3814,7 +3843,7 @@ void BytecodeGenerator::VisitNativeFunctionLiteral(
   // kDontAdaptArgumentsSentinel as their parameter count.
   int index = feedback_spec()->AddCreateClosureParameterCount(
       kDontAdaptArgumentsSentinel);
-  uint8_t flags = CreateClosureFlags::Encode(false, false, false);
+  uint8_t flags = CreateClosureFlags::Encode(false, false);
   builder()->CreateClosure(entry, index, flags);
   native_function_literals_.push_back(std::make_pair(expr, entry));
 }
@@ -7541,15 +7570,32 @@ void BytecodeGenerator::VisitArithmeticExpression(BinaryOperation* expr) {
   // key. In this case, we know it will eventually be internalized and it's
   // better to do so early.
   //
-  // For now, we handle only the specialized situation in which lhs is a string
-  // constant.
-  // TODO(jgruber): Generalize. ConsString literals, rhs-as-literal,
-  // property-key but no string-literal, string-literal but no property-key.
-  const bool emit_add_lhs_is_string_constant_internalize =
+  // For now, we handle only the specialized situation in which one side is a
+  // string constant.
+  // TODO(jgruber): Generalize. ConsString literals, property-key but no
+  // string-literal, string-literal but no property-key.
+  const bool maybe_emit_specialized_string_add =
       expr->op() == Token::kAdd && execution_result()->IsValueAsPropertyKey() &&
-      expr->left()->IsLiteral() && expr->left()->AsLiteral()->IsRawString() &&
       v8_flags.cache_property_key_string_adds;
-  if (emit_add_lhs_is_string_constant_internalize) {
+  bool emit_add_string_constant_internalize = false;
+  using ASVariant = AddStringConstantAndInternalizeVariant;
+  auto as_variant = ASVariant::kLhsIsStringConstant;
+  if (maybe_emit_specialized_string_add) {
+    // Is lhs a string constant?
+    emit_add_string_constant_internalize =
+        expr->left()->IsLiteral() && expr->left()->AsLiteral()->IsRawString();
+    if (!emit_add_string_constant_internalize) {
+      // Is rhs a string constant?
+      emit_add_string_constant_internalize =
+          expr->right()->IsLiteral() &&
+          expr->right()->AsLiteral()->IsRawString();
+      if (emit_add_string_constant_internalize) {
+        as_variant = ASVariant::kRhsIsStringConstant;
+      }
+    }
+  }
+
+  if (emit_add_string_constant_internalize) {
     slot = feedback_spec()->AddStringAddAndInternalizeICSlot();
   } else {
     slot = feedback_spec()->AddBinaryOpICSlot();
@@ -7575,11 +7621,18 @@ void BytecodeGenerator::VisitArithmeticExpression(BinaryOperation* expr) {
       execution_result()->SetResultIsString();
     }
 
-    if (emit_add_lhs_is_string_constant_internalize) {
-      DCHECK(IsStringTypeHint(lhs_type));
+    if (emit_add_string_constant_internalize) {
+      // Subtle: Stack overflows can cause the AST to be visited only
+      // partially. Visitation is eventually aborted and the resulting
+      // bytecode discarded.
+      DCHECK_IMPLIES(
+          !HasStackOverflow(),
+          IsStringTypeHint(as_variant == ASVariant::kLhsIsStringConstant
+                               ? lhs_type
+                               : rhs_type));
       builder()->SetExpressionPosition(expr);
-      builder()->Add_LhsIsStringConstant_Internalize(expr->op(), lhs,
-                                                     feedback_index(slot));
+      builder()->Add_StringConstant_Internalize(
+          expr->op(), lhs, feedback_index(slot), as_variant);
     } else {
       builder()->SetExpressionPosition(expr);
       builder()->BinaryOperation(expr->op(), lhs, feedback_index(slot));
@@ -8338,6 +8391,8 @@ void BytecodeGenerator::VisitNewTargetVariable(Variable* variable) {
   BuildVariableAssignment(variable, Token::kInit, HoleCheckMode::kElided);
 }
 
+// Create a generator object if necessary and initialize the
+// {.generator_object} variable.
 void BytecodeGenerator::BuildGeneratorObjectVariableInitialization() {
   DCHECK(IsResumableFunction(info()->literal()->kind()));
 

@@ -118,7 +118,6 @@ class StackHandler {
   V(EXIT, ExitFrame)                                                      \
   IF_WASM(V, WASM, WasmFrame)                                             \
   IF_WASM(V, WASM_TO_JS, WasmToJsFrame)                                   \
-  IF_WASM(V, WASM_TO_JS_FUNCTION, WasmToJsFunctionFrame)                  \
   IF_WASM(V, JS_TO_WASM, JsToWasmFrame)                                   \
   IF_WASM(V, STACK_SWITCH, StackSwitchFrame)                              \
   IF_WASM_DRUMBRAKE(V, WASM_INTERPRETER_ENTRY, WasmInterpreterEntryFrame) \
@@ -258,9 +257,7 @@ class StackFrame {
   }
 #endif  // V8_ENABLE_DRUMBRAKE
   bool is_wasm_debug_break() const { return type() == WASM_DEBUG_BREAK; }
-  bool is_wasm_to_js() const {
-    return type() == WASM_TO_JS || type() == WASM_TO_JS_FUNCTION;
-  }
+  bool is_wasm_to_js() const { return type() == WASM_TO_JS; }
   bool is_js_to_wasm() const { return type() == JS_TO_WASM; }
 #endif  // V8_ENABLE_WEBASSEMBLY
   bool is_builtin() const { return type() == BUILTIN; }
@@ -708,7 +705,6 @@ class TypedFrame : public CommonFrame {
   void Iterate(RootVisitor* v) const override;
 
   void IterateParamsOfGenericWasmToJSWrapper(RootVisitor* v) const;
-  void IterateParamsOfOptimizedWasmToJSWrapper(RootVisitor* v) const;
 
  protected:
   inline explicit TypedFrame(StackFrameIteratorBase* iterator);
@@ -1422,17 +1418,6 @@ class WasmToJsFrame : public WasmFrame {
   friend class StackFrameIteratorBase;
 };
 
-class WasmToJsFunctionFrame : public TypedFrame {
- public:
-  Type type() const override { return WASM_TO_JS_FUNCTION; }
-
- protected:
-  inline explicit WasmToJsFunctionFrame(StackFrameIteratorBase* iterator);
-
- private:
-  friend class StackFrameIteratorBase;
-};
-
 class JsToWasmFrame : public StubFrame {
  public:
   Type type() const override { return JS_TO_WASM; }
@@ -1857,7 +1842,8 @@ class StackFrameIteratorForProfiler : public StackFrameIteratorBase {
   ExternalCallbackScope* external_callback_scope_;
   Address top_link_register_;
 #if V8_ENABLE_WEBASSEMBLY
-  std::vector<std::unique_ptr<wasm::StackMemory>>& wasm_stacks_;
+  std::vector<std::unique_ptr<wasm::StackMemory, wasm::StackMemoryDeleter>>&
+      wasm_stacks_;
 #endif
 };
 

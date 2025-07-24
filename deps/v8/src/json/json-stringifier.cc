@@ -6,6 +6,7 @@
 
 #include <string_view>
 
+#include "absl/functional/overload.h"
 #include "hwy/highway.h"
 #include "src/base/strings.h"
 #include "src/common/assert-scope.h"
@@ -557,15 +558,15 @@ bool DoNotEscape(const SrcChar* chars, size_t length,
 
 bool IsFastKey(Tagged<String> key, const DisallowGarbageCollection& no_gc) {
   return key->DispatchToSpecificType(
-      base::overloaded{[&](Tagged<SeqOneByteString> str) {
-                         const uint8_t* chars = str->GetChars(no_gc);
-                         return DoNotEscape(chars, str->length(), no_gc);
-                       },
-                       [&](Tagged<ExternalOneByteString> str) {
-                         const uint8_t* chars = str->GetChars();
-                         return DoNotEscape(chars, str->length(), no_gc);
-                       },
-                       [&](Tagged<String> str) { return false; }});
+      absl::Overload{[&](Tagged<SeqOneByteString> str) {
+                       const uint8_t* chars = str->GetChars(no_gc);
+                       return DoNotEscape(chars, str->length(), no_gc);
+                     },
+                     [&](Tagged<ExternalOneByteString> str) {
+                       const uint8_t* chars = str->GetChars();
+                       return DoNotEscape(chars, str->length(), no_gc);
+                     },
+                     [&](Tagged<String> str) { return false; }});
 }
 
 bool CanFastSerializeJSArray(Isolate* isolate, Tagged<JSArray> object) {
@@ -750,7 +751,7 @@ MaybeHandle<JSAny> JsonStringifier::ApplyToJsonFunction(
   if (!IsCallable(*fun)) return object;
 
   // Call toJSON function.
-  if (IsSmi(*key)) key = factory()->NumberToString(key);
+  if (IsSmi(*key)) key = factory()->SmiToString(Cast<Smi>(*key));
   DirectHandle<Object> args[] = {key};
   ASSIGN_RETURN_ON_EXCEPTION(isolate_, object,
                              Cast<JSAny>(Execution::Call(
@@ -762,7 +763,7 @@ MaybeHandle<JSAny> JsonStringifier::ApplyReplacerFunction(
     Handle<JSAny> value, DirectHandle<Object> key,
     DirectHandle<Object> initial_holder) {
   HandleScope scope(isolate_);
-  if (IsSmi(*key)) key = factory()->NumberToString(key);
+  if (IsSmi(*key)) key = factory()->SmiToString(Cast<Smi>(*key));
   DirectHandle<Object> args[] = {key, value};
   DirectHandle<JSReceiver> holder = CurrentHolder(value, initial_holder);
   ASSIGN_RETURN_ON_EXCEPTION(
@@ -2682,7 +2683,7 @@ FastJsonStringifier<Char>::SerializeJSPrimitiveWrapper(
     Tagged<String> string = Cast<String>(raw);
     while (true) {
       FastJsonStringifierResult result =
-          string->DispatchToSpecificType(base::overloaded{
+          string->DispatchToSpecificType(absl::Overload{
               [&](Tagged<SeqOneByteString> str) {
                 return SerializeString<SeqOneByteString>(str, no_gc);
               },
@@ -3397,6 +3398,7 @@ bool FastJsonStringifier<Char>::AppendStringSIMD(
     const size_t char_index = block - chars + index;
     const size_t copy_length = char_index - uncopied_src_index;
     buffer_.Append(chars + uncopied_src_index, copy_length);
+    SBXCHECK_LT(found_char, 0x60);
     AppendCStringUnchecked(
         &JsonEscapeTable[found_char * kJsonEscapeTableEntrySize]);
     uncopied_src_index = char_index + 1;

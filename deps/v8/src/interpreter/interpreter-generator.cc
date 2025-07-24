@@ -964,7 +964,7 @@ class InterpreterBinaryOpAssembler : public InterpreterAssembler {
       TNode<UintPtrT> slot, const LazyNode<HeapObject>& maybe_feedback_vector,
       UpdateFeedbackMode update_feedback_mode, bool rhs_known_smi);
 
-  void BinaryOpWithFeedback(BinaryOpGenerator generator) {
+  void BinaryOpWithFeedback_WithoutDispatch(BinaryOpGenerator generator) {
     TNode<Object> lhs = LoadRegisterAtOperandIndex(0);
     TNode<Object> rhs = GetAccumulator();
     TNode<Context> context = GetContext();
@@ -978,6 +978,10 @@ class InterpreterBinaryOpAssembler : public InterpreterAssembler {
         [=] { return context; }, lhs, rhs, slot_index,
         [=] { return maybe_feedback_vector; }, mode, false);
     SetAccumulator(result);
+  }
+
+  void BinaryOpWithFeedback(BinaryOpGenerator generator) {
+    BinaryOpWithFeedback_WithoutDispatch(generator);
     Dispatch();
   }
 
@@ -1006,14 +1010,40 @@ IGNITION_HANDLER(Add, InterpreterBinaryOpAssembler) {
   BinaryOpWithFeedback(&BinaryOpAssembler::Generate_AddWithFeedback);
 }
 
-// Add_LhsIsConstant_Internalize <src>
+// Add_StringConstant_Internalize <src>
 //
 // Add register <src> to accumulator.
-IGNITION_HANDLER(Add_LhsIsStringConstant_Internalize,
-                 InterpreterBinaryOpAssembler) {
-  BinaryOpWithFeedback(
+IGNITION_HANDLER(Add_StringConstant_Internalize, InterpreterBinaryOpAssembler) {
+  auto as_variant = UncheckedCast<Int32T>(BytecodeOperandFlag8(2));
+  using ASVariant = AddStringConstantAndInternalizeVariant;
+  auto lhs_is_sc =
+      Int32Constant(static_cast<uint8_t>(ASVariant::kLhsIsStringConstant));
+
+  Label if_lhs_is_string_constant(this), if_rhs_is_string_constant(this),
+      done(this);
+  Branch(Word32Equal(as_variant, lhs_is_sc), &if_lhs_is_string_constant,
+         &if_rhs_is_string_constant);
+
+  BIND(&if_lhs_is_string_constant);
+  CSA_DCHECK(this, Word32Equal(as_variant, lhs_is_sc));
+  BinaryOpWithFeedback_WithoutDispatch(
       &BinaryOpAssembler::
           Generate_AddLhsIsStringConstantInternalizeWithFeedback);
+  Goto(&done);
+
+  BIND(&if_rhs_is_string_constant);
+#ifdef DEBUG
+  auto rhs_is_sc =
+      Int32Constant(static_cast<uint8_t>(ASVariant::kRhsIsStringConstant));
+  CSA_DCHECK(this, Word32Equal(as_variant, rhs_is_sc));
+#endif  // DEBUG
+  BinaryOpWithFeedback_WithoutDispatch(
+      &BinaryOpAssembler::
+          Generate_AddRhsIsStringConstantInternalizeWithFeedback);
+  Goto(&done);
+
+  BIND(&done);
+  Dispatch();
 }
 
 // Sub <src>
@@ -2814,7 +2844,23 @@ IGNITION_HANDLER(CreateFunctionContext, InterpreterAssembler) {
   TNode<Context> context = GetContext();
   ConstructorBuiltinsAssembler constructor_assembler(state());
   SetAccumulator(constructor_assembler.FastNewFunctionContext(
-      scope_info, slots, context, FUNCTION_SCOPE));
+      scope_info, slots, context, FUNCTION_SCOPE,
+      ContextMode::kNoContextCells));
+  Dispatch();
+}
+
+// CreateFunctionContext <scope_info_idx> <slots>
+//
+// Creates a new context with number of |slots| for the function closure.
+IGNITION_HANDLER(CreateFunctionContextWithCells, InterpreterAssembler) {
+  TNode<UintPtrT> scope_info_idx = BytecodeOperandIdx(0);
+  TNode<ScopeInfo> scope_info = CAST(LoadConstantPoolEntry(scope_info_idx));
+  TNode<Uint32T> slots = BytecodeOperandUImm(1);
+  TNode<Context> context = GetContext();
+  ConstructorBuiltinsAssembler constructor_assembler(state());
+  SetAccumulator(constructor_assembler.FastNewFunctionContext(
+      scope_info, slots, context, FUNCTION_SCOPE,
+      ContextMode::kHasContextCells));
   Dispatch();
 }
 
@@ -2828,7 +2874,7 @@ IGNITION_HANDLER(CreateEvalContext, InterpreterAssembler) {
   TNode<Context> context = GetContext();
   ConstructorBuiltinsAssembler constructor_assembler(state());
   SetAccumulator(constructor_assembler.FastNewFunctionContext(
-      scope_info, slots, context, EVAL_SCOPE));
+      scope_info, slots, context, EVAL_SCOPE, ContextMode::kNoContextCells));
   Dispatch();
 }
 
@@ -3227,6 +3273,108 @@ IGNITION_HANDLER(ForInStep, InterpreterAssembler) {
   TNode<Smi> one = SmiConstant(1);
   TNode<Smi> result = SmiAdd(index, one);
   StoreRegisterAtOperandIndex(result, 0);
+  Dispatch();
+}
+
+// ForOfNext <object> <next> <value>
+//
+// Get the next value of the iterable and returns done in the accumulator.
+IGNITION_HANDLER(ForOfNext, InterpreterAssembler) {
+  TNode<Object> object = LoadRegisterAtOperandIndex(0);
+  TNode<Object> next = LoadRegisterAtOperandIndex(1);
+  TNode<Context> context = GetContext();
+
+  Label slow_path(this), reach_end(this), dispatch(this);
+
+  // object has already been checked to be an JSReceiver when building
+  // the iterator record in bytecode generator (BuildGetIterator).
+  TNode<BoolT> is_array_iterator = IsJSArrayIterator(CAST(object));
+  GotoIfNot(is_array_iterator, &slow_path);
+
+  // Fast path for JSArrayIterator.
+  {
+    TNode<JSArrayIterator> array_iterator = CAST(object);
+    TNode<JSArray> iterated_array = CAST(LoadObjectField(
+        array_iterator, JSArrayIterator::kIteratedObjectOffset));
+
+    TNode<Map> map = LoadMap(iterated_array);
+    TNode<Int32T> elements_kind = LoadMapElementsKind(map);
+    GotoIfNot(IsFastElementsKind(elements_kind), &slow_path);
+
+    TNode<Smi> length = LoadFastJSArrayLength(iterated_array);
+    TNode<Number> current_index = LoadObjectField<Number>(
+        array_iterator, JSArrayIterator::kNextIndexOffset);
+    TNode<Smi> smi_index = CAST(current_index);
+    GotoIf(SmiGreaterThanOrEqual(smi_index, length), &reach_end);
+
+    TNode<Smi> iteration_kind =
+        LoadObjectField<Smi>(array_iterator, JSArrayIterator::kKindOffset);
+
+    TVARIABLE(Object, var_element_value);
+    TNode<FixedArrayBase> elements = LoadElements(iterated_array);
+
+    Label load_key(this), load_entry(this);
+    GotoIf(SmiEqual(iteration_kind, SmiConstant(IterationKind::kKeys)),
+           &load_key);
+
+    Label if_double(this), if_smi_or_object(this), done(this);
+    Branch(IsDoubleElementsKind(elements_kind), &if_double, &if_smi_or_object);
+    BIND(&if_smi_or_object);
+    {
+      var_element_value = LoadFixedArrayElement(CAST(elements), smi_index);
+      GotoIf(SmiEqual(iteration_kind, SmiConstant(IterationKind::kEntries)),
+             &load_entry);
+      Goto(&done);
+    }
+    BIND(&if_double);
+    {
+      TNode<Float64T> value = LoadFixedDoubleArrayElement(
+          CAST(elements), SmiToIntPtr(smi_index), &slow_path, &slow_path);
+      var_element_value = AllocateHeapNumberWithValue(value);
+      GotoIf(SmiEqual(iteration_kind, SmiConstant(IterationKind::kEntries)),
+             &load_entry);
+      Goto(&done);
+    }
+
+    BIND(&load_key);
+    {
+      var_element_value = smi_index;
+      Goto(&done);
+    }
+
+    BIND(&load_entry);
+    {
+      var_element_value = AllocateJSIteratorResultValueForEntry(
+          context, smi_index, var_element_value.value());
+      Goto(&done);
+    }
+
+    BIND(&done);
+    {
+      StoreObjectFieldNoWriteBarrier(array_iterator,
+                                     JSArrayIterator::kNextIndexOffset,
+                                     SmiAdd(smi_index, SmiConstant(1)));
+      SetAccumulator(FalseConstant());
+      StoreRegisterAtOperandIndex(var_element_value.value(), 2);
+      Goto(&dispatch);
+    }
+
+    BIND(&reach_end);
+    {
+      SetAccumulator(TrueConstant());
+      Goto(&dispatch);
+    }
+  }
+
+  BIND(&slow_path);
+  {
+    auto [value, done_value] = CallIteratorNext(object, next, context);
+    SetAccumulator(done_value);
+    StoreRegisterAtOperandIndex(value, 2);
+    Goto(&dispatch);
+  }
+
+  BIND(&dispatch);
   Dispatch();
 }
 

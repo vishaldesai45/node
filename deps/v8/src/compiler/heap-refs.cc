@@ -285,6 +285,13 @@ class JSObjectData : public JSReceiverData {
       : JSReceiverData(broker, storage, object, kind) {}
 };
 
+class JSProxyData : public JSReceiverData {
+ public:
+  JSProxyData(JSHeapBroker* broker, ObjectData** storage,
+              IndirectHandle<JSProxy> object, ObjectDataKind kind)
+      : JSReceiverData(broker, storage, object, kind) {}
+};
+
 namespace {
 
 // Separate function for racy HeapNumber value read, so that we can explicitly
@@ -732,7 +739,7 @@ bool JSFunctionData::IsConsistentWithHeapState(JSHeapBroker* broker) const {
     }
     if (has_used_field(kInitialMapInstanceSizeWithMinSlack) &&
         initial_map_instance_size_with_min_slack_ !=
-            f->ComputeInstanceSizeWithMinSlack(f->GetIsolate())) {
+            f->ComputeInstanceSizeWithMinSlack(broker->isolate())) {
       TRACE_BROKER_MISSING(broker,
                            "JSFunction::ComputeInstanceSizeWithMinSlack");
       return false;
@@ -1128,9 +1135,9 @@ int ObjectRef::AsSmi() const {
   return Cast<Smi>(*object()).value();
 }
 
-#define DEF_TESTER(Type, ...)                              \
-  bool MapRef::Is##Type##Map() const {                     \
-    return InstanceTypeChecker::Is##Type(instance_type()); \
+#define DEF_TESTER(Type, ...)                        \
+  bool MapRef::Is##Type##Map() const {               \
+    return InstanceTypeChecker::Is##Type(*object()); \
   }
 INSTANCE_TYPE_CHECKERS(DEF_TESTER)
 #undef DEF_TESTER
@@ -1139,10 +1146,20 @@ bool MapRef::IsBooleanMap(JSHeapBroker* broker) const {
   return *this == broker->boolean_map();
 }
 
+bool MapRef::IsNullMap(JSHeapBroker* broker) const {
+  return *this == broker->null_map();
+}
+
+bool MapRef::IsUndefinedMap(JSHeapBroker* broker) const {
+  return *this == broker->undefined_map();
+}
+
+bool MapRef::IsSeqStringMap() const {
+  return InstanceTypeChecker::IsSeqString(*object());
+}
+
 bool MapRef::IsThinStringMap() const {
-  // The check below only works for string maps.
-  DCHECK(IsStringMap());
-  return InstanceTypeChecker::IsThinString(instance_type());
+  return InstanceTypeChecker::IsThinString(*object());
 }
 
 bool MapRef::IsStringWrapperMap() const {
@@ -1150,8 +1167,12 @@ bool MapRef::IsStringWrapperMap() const {
          IsStringWrapperElementsKind(elements_kind());
 }
 
+bool MapRef::IsOneByteStringMap() const {
+  return InstanceTypeChecker::IsOneByteString(*object());
+}
+
 bool MapRef::IsTwoByteStringMap() const {
-  return InstanceTypeChecker::IsTwoByteString(instance_type());
+  return InstanceTypeChecker::IsTwoByteString(*object());
 }
 
 bool MapRef::CanInlineElementAccess() const {
@@ -1461,6 +1482,15 @@ std::optional<double> StringRef::ToInt(JSHeapBroker* broker, int radix) {
   return TryStringToInt(broker->local_isolate(), object(), radix);
 }
 
+StringRef StringRef::UnpackIfThin(JSHeapBroker* broker) {
+  IndirectHandle<String> obj = object();
+  if (InstanceTypeChecker::IsThinString(obj->map(kAcquireLoad))) {
+    // String::MakeThin sets the map with ReleaseStore after storing actual().
+    return MakeRefAssumeMemoryFence(broker, Cast<ThinString>(obj)->actual());
+  }
+  return *this;
+}
+
 int ArrayBoilerplateDescriptionRef::constants_elements_length() const {
   return object()->constant_elements()->length();
 }
@@ -1616,6 +1646,7 @@ HEAP_ACCESSOR_B(Map, bit_field3, NumberOfOwnDescriptors,
                 Map::Bits3::NumberOfOwnDescriptorsBits)
 HEAP_ACCESSOR_B(Map, bit_field3, is_migration_target,
                 Map::Bits3::IsMigrationTargetBit)
+BIMODAL_ACCESSOR_B(Map, bit_field3, is_extensible, Map::Bits3::IsExtensibleBit)
 BIMODAL_ACCESSOR_B(Map, bit_field3, construction_counter,
                    Map::Bits3::ConstructionCounterBits)
 HEAP_ACCESSOR_B(Map, bit_field, has_prototype_slot,
@@ -1624,6 +1655,8 @@ HEAP_ACCESSOR_B(Map, bit_field, is_access_check_needed,
                 Map::Bits1::IsAccessCheckNeededBit)
 HEAP_ACCESSOR_B(Map, bit_field, is_callable, Map::Bits1::IsCallableBit)
 HEAP_ACCESSOR_B(Map, bit_field, has_indexed_interceptor,
+                Map::Bits1::HasIndexedInterceptorBit)
+HEAP_ACCESSOR_B(Map, bit_field, has_named_interceptor,
                 Map::Bits1::HasIndexedInterceptorBit)
 HEAP_ACCESSOR_B(Map, bit_field, is_constructor, Map::Bits1::IsConstructorBit)
 HEAP_ACCESSOR_B(Map, bit_field, is_undetectable, Map::Bits1::IsUndetectableBit)
@@ -1754,10 +1787,10 @@ bool SharedFunctionInfoRef::HasBreakInfo(JSHeapBroker* broker) const {
 }
 
 SharedFunctionInfo::Inlineability SharedFunctionInfoRef::GetInlineability(
-    JSHeapBroker* broker) const {
+    CodeKind code_kind, JSHeapBroker* broker) const {
   return broker->IsMainThread()
-             ? object()->GetInlineability(broker->isolate())
-             : object()->GetInlineability(broker->local_isolate());
+             ? object()->GetInlineability(code_kind, broker->isolate())
+             : object()->GetInlineability(code_kind, broker->local_isolate());
 }
 
 ObjectRef FeedbackCellRef::value(JSHeapBroker* broker) const {
@@ -1808,9 +1841,9 @@ bool JSTypedArrayRef::is_on_heap() const {
   return object()->is_on_heap(kAcquireLoad);
 }
 
-size_t JSTypedArrayRef::length() const {
-  // Immutable after initialization (since this is not used for RAB/GSAB).
-  return object()->length();
+size_t JSTypedArrayRef::length(JSHeapBroker* broker) const {
+  return object()->byte_length() /
+         ElementsKindToByteSize(elements_kind(broker));
 }
 
 size_t JSTypedArrayRef::byte_length() const {
@@ -1993,6 +2026,10 @@ HoleType ObjectRef::HoleType() const {
 
 bool ObjectRef::IsNullOrUndefined() const { return IsNull() || IsUndefined(); }
 
+bool ObjectRef::IsUndefinedContextCell() const {
+  return i::IsUndefinedContextCell(*object());
+}
+
 std::optional<bool> ObjectRef::TryGetBooleanValue(JSHeapBroker* broker) const {
   if (data_->should_access_heap()) {
     return Object::BooleanValue(*object(), broker->isolate());
@@ -2024,6 +2061,20 @@ Maybe<double> ObjectRef::OddballToNumber(JSHeapBroker* broker) const {
 bool ObjectRef::should_access_heap() const {
   return data()->should_access_heap();
 }
+
+bool ObjectRef::is_read_only() const {
+  return data()->kind() == kUnserializedReadOnlyHeapObject;
+}
+
+// TODO(leszeks): Could/should these use the BIMODAL_ACCESSORS macro?
+OptionalObjectRef JSProxyRef::GetTarget(JSHeapBroker* broker) const {
+  return TryMakeRef(broker, object()->target());
+}
+OptionalObjectRef JSProxyRef::GetHandler(JSHeapBroker* broker) const {
+  return TryMakeRef(broker, object()->handler());
+}
+
+HEAP_ACCESSOR_B(JSProxy, flags, is_revocable, JSProxy::IsRevocableBit)
 
 OptionalObjectRef JSObjectRef::GetOwnConstantElement(
     JSHeapBroker* broker, FixedArrayBaseRef elements_ref, uint32_t index,

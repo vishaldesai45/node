@@ -79,6 +79,7 @@ class JSBinopReduction final {
       case CompareOperationHint::kBigInt64:
       case CompareOperationHint::kReceiver:
       case CompareOperationHint::kReceiverOrNullOrUndefined:
+      case CompareOperationHint::kStringOrOddball:
       case CompareOperationHint::kInternalizedString:
         break;
     }
@@ -98,6 +99,7 @@ class JSBinopReduction final {
       case CompareOperationHint::kSymbol:
       case CompareOperationHint::kReceiver:
       case CompareOperationHint::kReceiverOrNullOrUndefined:
+      case CompareOperationHint::kStringOrOddball:
       case CompareOperationHint::kInternalizedString:
         return false;
       case CompareOperationHint::kBigInt:
@@ -135,6 +137,13 @@ class JSBinopReduction final {
     DCHECK_EQ(1, node_->op()->EffectOutputCount());
     return (GetCompareOperationHint(node_) == CompareOperationHint::kString) &&
            BothInputsMaybe(Type::String());
+  }
+
+  bool IsStringOrOddballCompareOperation() {
+    DCHECK_EQ(1, node_->op()->EffectOutputCount());
+    return (GetCompareOperationHint(node_) ==
+            CompareOperationHint::kStringOrOddball) &&
+           BothInputsMaybe(Type::StringOrOddball());
   }
 
   bool IsSymbolCompareOperation() {
@@ -266,6 +275,23 @@ class JSBinopReduction final {
       Node* right_input =
           graph()->NewNode(simplified()->CheckString(FeedbackSource()), right(),
                            effect(), control());
+      node_->ReplaceInput(1, right_input);
+      update_effect(right_input);
+    }
+  }
+
+  void CheckInputsToStringOrOddball() {
+    if (!left_type().Is(Type::StringOrOddball())) {
+      Node* left_input =
+          graph()->NewNode(simplified()->CheckStringOrOddball(FeedbackSource()),
+                           left(), effect(), control());
+      node_->ReplaceInput(0, left_input);
+      update_effect(left_input);
+    }
+    if (!right_type().Is(Type::StringOrOddball())) {
+      Node* right_input =
+          graph()->NewNode(simplified()->CheckStringOrOddball(FeedbackSource()),
+                           right(), effect(), control());
       node_->ReplaceInput(1, right_input);
       update_effect(right_input);
     }
@@ -684,7 +710,7 @@ Node* JSTypedLowering::UnwrapStringWrapper(Node* string_or_wrapper,
 
   Node* vfalse = efalse = graph()->NewNode(
       simplified()->LoadField(AccessBuilder::ForJSPrimitiveWrapperValue()),
-      string_or_wrapper, *effect, *control);
+      string_or_wrapper, *effect, if_false);
 
   // The value read from a string wrapper is a string.
   vfalse = efalse = graph()->NewNode(common()->TypeGuard(Type::String()),
@@ -1041,7 +1067,10 @@ Reduction JSTypedLowering::ReduceJSStrictEqual(Node* node) {
   if (r.BothInputsAre(Type::String())) {
     return r.ChangeToPureOperator(simplified()->StringEqual());
   }
-
+  if (r.IsStringOrOddballCompareOperation()) {
+    r.CheckInputsToStringOrOddball();
+    return r.ChangeToPureOperator(simplified()->StringOrOddballStrictEqual());
+  }
   NumberOperationHint hint;
   BigIntOperationHint hint_bigint;
   if (r.BothInputsAre(Type::Signed32()) ||
@@ -1632,14 +1661,14 @@ Reduction JSTypedLowering::ReduceJSLoadContext(Node* node) {
                             .MachineSelectIf<Object>(gasm.Word32Equal(
                                 state, gasm.Int32Constant(ContextCell::kInt32)))
                             .Then([&] {
-                              return gasm.AllocateHeapNumber(gasm.LoadField(
+                              return gasm.LoadField<Number>(
                                   AccessBuilder::ForContextCellInt32Value(),
-                                  value));
+                                  heap_value);
                             })
                             .Else([&] {
-                              return gasm.AllocateHeapNumber(gasm.LoadField(
+                              return gasm.LoadField<Number>(
                                   AccessBuilder::ForContextCellFloat64Value(),
-                                  value));
+                                  heap_value);
                             })
                             .Value();
                       })
@@ -1682,6 +1711,7 @@ Reduction JSTypedLowering::ReduceJSStoreContext(Node* node) {
   ContextAccess const& access = ContextAccessOf(node->op());
   Node* effect = NodeProperties::GetEffectInput(node);
   Node* control = NodeProperties::GetControlInput(node);
+  FrameState frame_state{NodeProperties::GetFrameStateInput(node)};
   JSGraphAssembler gasm(broker(), jsgraph(), jsgraph()->zone(),
                         BranchSemantics::kJS);
   gasm.InitializeEffectControl(effect, control);
@@ -1709,50 +1739,9 @@ Reduction JSTypedLowering::ReduceJSStoreContext(Node* node) {
             gasm.LoadMap(TNode<HeapObject>::UncheckedCast(old_value));
         gasm.If(gasm.IsContextCellMap(old_value_map))
             .Then([&] {
-              TNode<ContextCell> cell =
-                  TNode<ContextCell>::UncheckedCast(old_value);
-              TNode<Int32T> state = gasm.LoadField<Int32T>(
-                  AccessBuilder::ForContextCellState(), cell);
-              gasm
-                  .MachineIf(gasm.Word32Equal(
-                      state, gasm.Int32Constant(ContextCell::kFloat64)))
-                  .Then([&] {
-                    Node* number_value = gasm.CheckNumber(new_value);
-                    gasm.StoreField(AccessBuilder::ForContextCellFloat64Value(),
-                                    cell, number_value);
-                  })
-                  .Else([&] {
-                    gasm
-                        .MachineIf(gasm.Word32Equal(
-                            state, gasm.Int32Constant(ContextCell::kInt32)))
-                        .Then([&] {
-                          Node* number_value =
-                              gasm.CheckNumberFitsInt32(new_value);
-                          gasm.StoreField(
-                              AccessBuilder::ForContextCellInt32Value(), cell,
-                              number_value);
-                        })
-                        .Else([&] {
-                          gasm
-                              .MachineIf(gasm.Word32Equal(
-                                  state, gasm.Int32Constant(ContextCell::kSmi)))
-                              .Then([&] {
-                                Node* smi_value = gasm.CheckSmi(new_value);
-                                gasm.StoreField(
-                                    AccessBuilder::ForContextCellTaggedValue(),
-                                    cell, smi_value);
-                              })
-                              .Else([&] {
-                                TNode<Object> tagged_value = gasm.LoadField<
-                                    Object>(
-                                    AccessBuilder::ForContextCellTaggedValue(),
-                                    cell);
-                                gasm.CheckIf(gasm.ReferenceEqual(tagged_value,
-                                                                 new_value),
-                                             DeoptimizeReason::kWrongValue);
-                              });
-                        });
-                  });
+              gasm.DetachContextCell(context, new_value,
+                                     static_cast<int>(access.index()),
+                                     frame_state);
             })
             .Else([&] {
               gasm.StoreField(AccessBuilder::ForContextSlot(access.index()),

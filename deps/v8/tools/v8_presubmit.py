@@ -608,11 +608,6 @@ class SourceProcessor(SourceFileProcessor):
           print("%s Flag --maglev or --turbofan should be set if " \
                 "assertOptimized() is used" % name)
           result = False
-        if ASSERT_UNOPTIMIZED_PATTERN.search(contents) and \
-            not FLAGS_NO_ALWAYS_OPT.search(contents):
-          print("%s Flag --no-always-turbofan should be set if " \
-                "assertUnoptimized() is used" % name)
-          result = False
 
       match = self.runtime_function_call_pattern.search(contents)
       if match:
@@ -781,6 +776,8 @@ def FindTests(workspace):
       'tools/ignition/linux_perf_report_test.py',
       'tools/ignition/bytecode_dispatches_report_test.py',
       'tools/ignition/linux_perf_bytecode_annotate_test.py',
+      # TODO(https://crbug.com/430336825): Unskip once bug is resolved.
+      'tools/protoc_wrapper/protoc_wrapper_test.py',
   ]
   scripts_without_excluded = []
   for root, dirs, files in os.walk(join(workspace, 'tools')):

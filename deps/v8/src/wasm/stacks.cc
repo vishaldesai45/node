@@ -5,15 +5,62 @@
 #include "src/wasm/stacks.h"
 
 #include "src/base/platform/platform.h"
+#include "src/execution/frames.h"
 #include "src/execution/simulator.h"
 #include "src/wasm/wasm-engine.h"
 
 namespace v8::internal::wasm {
 
+void StackMemoryDeleter::operator()(StackMemory* stack) const {
+#ifdef V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
+  // TODO(427946951): Currently we need to allocate WasmStack objects on full
+  // OS pages.
+  stack->~StackMemory();
+  VirtualAddressSpace* vas = GetPlatformVirtualAddressSpace();
+  vas->FreePages(reinterpret_cast<Address>(stack),
+                 vas->allocation_granularity());
+#else
+  delete stack;
+#endif  // V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
+}
+
+// static
+std::unique_ptr<StackMemory, StackMemoryDeleter> StackMemory::New() {
+#ifdef V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
+  // TODO(427946951): WasmStack objects must currently be accessible to
+  // sandboxed code (which is unsafe). As such we need to register them as
+  // sandbox extension memory, which requires allocating them on full OS pages.
+  VirtualAddressSpace* vas = GetPlatformVirtualAddressSpace();
+  CHECK_LT(sizeof(StackMemory), vas->allocation_granularity());
+  Address backing_memory = vas->AllocatePages(
+      VirtualAddressSpace::kNoHint, vas->allocation_granularity(),
+      vas->allocation_granularity(), PagePermissions::kReadWrite);
+  SandboxHardwareSupport::RegisterUnsafeSandboxExtensionMemory(
+      backing_memory, vas->allocation_granularity());
+  return std::unique_ptr<StackMemory, StackMemoryDeleter>(
+      new (reinterpret_cast<void*>(backing_memory)) StackMemory());
+#else
+  return std::unique_ptr<StackMemory, StackMemoryDeleter>(new StackMemory());
+#endif  // V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
+}
+
 // static
 StackMemory* StackMemory::GetCentralStackView(Isolate* isolate) {
   base::Vector<uint8_t> view = SimulatorStack::GetCentralStackView(isolate);
+#ifdef V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
+  // See StackMemory::New for an explanation of why this is required.
+  VirtualAddressSpace* vas = GetPlatformVirtualAddressSpace();
+  CHECK_LT(sizeof(StackMemory), vas->allocation_granularity());
+  Address backing_memory = vas->AllocatePages(
+      VirtualAddressSpace::kNoHint, vas->allocation_granularity(),
+      vas->allocation_granularity(), PagePermissions::kReadWrite);
+  SandboxHardwareSupport::RegisterUnsafeSandboxExtensionMemory(
+      backing_memory, vas->allocation_granularity());
+  return new (reinterpret_cast<void*>(backing_memory))
+      StackMemory(view.begin(), view.size());
+#else
   return new StackMemory(view.begin(), view.size());
+#endif  // V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
 }
 
 StackMemory::~StackMemory() {
@@ -30,7 +77,8 @@ StackMemory::~StackMemory() {
 
 void* StackMemory::jslimit() const {
   return (active_segment_ ? active_segment_->limit_ : limit_) +
-         SimulatorStack::JSStackLimitMargin();
+         (owned_ ? StackMemory::JSGrowableStackLimitMarginKB() * KB
+                 : StackMemory::JSCentralStackLimitMarginKB() * KB);
 }
 
 StackMemory::StackMemory() : owned_(true) {
@@ -42,9 +90,11 @@ StackMemory::StackMemory() : owned_(true) {
   const size_t size_limit = v8_flags.stack_size;
   PageAllocator* allocator = GetPlatformPageAllocator();
   auto page_size = allocator->AllocatePageSize();
-  size_t initial_size = std::min<size_t>(
-      size_limit * KB,
-      kJsStackSizeKB * KB + SimulatorStack::JSStackLimitMargin());
+  size_t initial_size =
+      std::min<size_t>(
+          size_limit,
+          kJsStackSizeKB + StackMemory::JSGrowableStackLimitMarginKB()) *
+      KB;
   first_segment_ =
       new StackSegment(RoundUp(initial_size, page_size) / page_size);
   active_segment_ = first_segment_;
@@ -65,25 +115,58 @@ StackMemory::StackMemory(uint8_t* limit, size_t size)
 StackMemory::StackSegment::StackSegment(size_t pages) {
   DCHECK_GE(pages, 1);
   PageAllocator* allocator = GetPlatformPageAllocator();
-  size_ = pages * allocator->AllocatePageSize();
-  limit_ = static_cast<uint8_t*>(
-      allocator->AllocatePages(nullptr, size_, allocator->AllocatePageSize(),
-                               PageAllocator::kReadWrite));
-  if (limit_ == nullptr) {
+  size_t page_size = allocator->AllocatePageSize();
+  size_ = pages * page_size;
+  // Reserve one guard page before and after the stack memory.
+  limit_ = static_cast<uint8_t*>(allocator->AllocatePages(
+      nullptr, size_ + 2 * page_size, allocator->AllocatePageSize(),
+      PageAllocator::kNoAccess));
+  if (limit_ == nullptr || !SetPermissions(allocator, limit_ + page_size, size_,
+                                           PageAllocator::kReadWrite)) {
     V8::FatalProcessOutOfMemory(nullptr,
                                 "StackMemory::StackSegment::StackSegment");
   }
+  limit_ += page_size;
+#ifdef V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
+  // The actual stack memory must be accessible to sandboxed code, so we need
+  // to register it as sandbox extension memory here.
+  // TODO(saelo): this is probably actually the right thing to do and not
+  // unsafe. Consider creating a non-unsafe version of this method.
+  SandboxHardwareSupport::RegisterUnsafeSandboxExtensionMemory(
+      reinterpret_cast<Address>(limit_), size_);
+#endif  // V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
 }
 
 StackMemory::StackSegment::~StackSegment() {
   PageAllocator* allocator = GetPlatformPageAllocator();
-  if (!allocator->DecommitPages(limit_, size_)) {
+  size_t page_size = allocator->AllocatePageSize();
+  if (!allocator->DecommitPages(limit_ - page_size, size_ + 2 * page_size)) {
     V8::FatalProcessOutOfMemory(nullptr, "Decommit stack memory");
   }
 }
 
-bool StackMemory::Grow(Address current_fp) {
+void StackMemory::Iterate(v8::internal::RootVisitor* v, Isolate* isolate) {
+  for (StackFrameIterator it(isolate, this); !it.done(); it.Advance()) {
+    it.frame()->Iterate(v);
+  }
+  v->VisitRootPointer(
+      Root::kStackRoots, nullptr,
+      FullObjectSlot(reinterpret_cast<Address>(&this->current_cont_)));
+}
+
+bool StackMemory::Grow(Address current_fp, size_t min_size) {
   DCHECK(owned_);
+  while (V8_UNLIKELY(active_segment_->next_segment_ != nullptr &&
+                     active_segment_->next_segment_->size_ < min_size)) {
+    // If the next segment is too small to fit the evicted frame, remove it.
+    StackSegment* to_delete = active_segment_->next_segment_;
+    active_segment_->next_segment_ =
+        active_segment_->next_segment_->next_segment_;
+    if (active_segment_->next_segment_ != nullptr) {
+      active_segment_->next_segment_->prev_segment_ = active_segment_;
+    }
+    delete to_delete;
+  }
   if (active_segment_->next_segment_ != nullptr) {
     active_segment_ = active_segment_->next_segment_;
   } else {
@@ -91,15 +174,17 @@ bool StackMemory::Grow(Address current_fp) {
     auto page_size = allocator->AllocatePageSize();
     const size_t size_limit = RoundUp(v8_flags.stack_size * KB, page_size);
     DCHECK_GE(size_limit, size_);
-    size_t room_to_grow = size_limit - size_;
-    size_t new_size = std::min(2 * active_segment_->size_, room_to_grow);
-    if (new_size < page_size) {
-      // We cannot grow less than page size.
+    size_t room_to_grow = RoundDown(size_limit - size_, page_size);
+    min_size = RoundUp(min_size, page_size);
+    if (room_to_grow < min_size) {
       if (v8_flags.trace_wasm_stack_switching) {
         PrintF("Stack #%d reached the grow limit %zu bytes\n", id_, size_limit);
       }
       return false;
     }
+    size_t new_size =
+        std::clamp(2 * active_segment_->size_, min_size, room_to_grow);
+    DCHECK_EQ(new_size % page_size, 0);
     auto new_segment = new StackSegment(new_size / page_size);
     new_segment->prev_segment_ = active_segment_;
     active_segment_->next_segment_ = new_segment;
@@ -146,14 +231,19 @@ void StackMemory::Reset() {
   active_segment_ = first_segment_;
   size_ = active_segment_->size_;
   clear_stack_switch_info();
+  current_cont_ = {};
 }
 
-std::unique_ptr<StackMemory> StackPool::GetOrAllocate() {
+bool StackMemory::IsValidContinuation(Tagged<WasmContinuationObject> cont) {
+  return current_cont_ == cont;
+}
+
+std::unique_ptr<StackMemory, StackMemoryDeleter> StackPool::GetOrAllocate() {
   while (size_ > kMaxSize) {
     size_ -= freelist_.back()->allocated_size();
     freelist_.pop_back();
   }
-  std::unique_ptr<StackMemory> stack;
+  std::unique_ptr<StackMemory, StackMemoryDeleter> stack;
   if (freelist_.empty()) {
     stack = StackMemory::New();
   } else {
@@ -168,7 +258,7 @@ std::unique_ptr<StackMemory> StackPool::GetOrAllocate() {
   return stack;
 }
 
-void StackPool::Add(std::unique_ptr<StackMemory> stack) {
+void StackPool::Add(std::unique_ptr<StackMemory, StackMemoryDeleter> stack) {
   // Add the stack to the pool regardless of kMaxSize, because the stack might
   // still be in use by the unwinder.
   // Shrink the freelist lazily when we get the next stack instead.

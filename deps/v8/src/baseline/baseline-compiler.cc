@@ -321,6 +321,10 @@ void BaselineCompiler::GenerateCode() {
   DCHECK_EQ(__ pc_offset(), 0);
   __ CodeEntry();
 
+#ifdef V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
+  __ AssertInSandboxedExecutionMode();
+#endif  // V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
+
   {
     RCS_BASELINE_SCOPE(Visit);
     Prologue();
@@ -1076,9 +1080,23 @@ void BaselineCompiler::VisitAdd() {
       RegisterOperand(0), kInterpreterAccumulatorRegister, Index(1));
 }
 
-void BaselineCompiler::VisitAdd_LhsIsStringConstant_Internalize() {
-  CallBuiltin<Builtin::kAdd_LhsIsStringConstant_Internalize_Baseline>(
-      RegisterOperand(0), kInterpreterAccumulatorRegister, Index(1));
+void BaselineCompiler::VisitAdd_StringConstant_Internalize() {
+  using ASVariant = AddStringConstantAndInternalizeVariant;
+  uint8_t flags = Flag8(2);
+  const ASVariant as_variant = static_cast<ASVariant>(flags);
+  DCHECK(as_variant == ASVariant::kLhsIsStringConstant ||
+         as_variant == ASVariant::kRhsIsStringConstant);
+  static constexpr auto kTargetL =
+      Builtin::kAdd_LhsIsStringConstant_Internalize_Baseline;
+  static constexpr auto kTargetR =
+      Builtin::kAdd_RhsIsStringConstant_Internalize_Baseline;
+  if (as_variant == ASVariant::kLhsIsStringConstant) {
+    CallBuiltin<kTargetL>(RegisterOperand(0), kInterpreterAccumulatorRegister,
+                          Index(1));
+  } else {
+    CallBuiltin<kTargetR>(RegisterOperand(0), kInterpreterAccumulatorRegister,
+                          Index(1));
+  }
 }
 
 void BaselineCompiler::VisitSub() {
@@ -1990,6 +2008,15 @@ void BaselineCompiler::VisitCreateFunctionContext() {
   CallBuiltin<Builtin::kFastNewFunctionContextFunction>(info, slot_count);
 }
 
+void BaselineCompiler::VisitCreateFunctionContextWithCells() {
+  Handle<ScopeInfo> info = Constant<ScopeInfo>(0);
+  uint32_t slot_count = Uint(1);
+  DCHECK_LE(slot_count, ConstructorBuiltins::MaximumFunctionContextSlots());
+  DCHECK_EQ(info->scope_type(), ScopeType::FUNCTION_SCOPE);
+  CallBuiltin<Builtin::kFastNewFunctionContextFunctionWithCells>(info,
+                                                                 slot_count);
+}
+
 void BaselineCompiler::VisitCreateEvalContext() {
   Handle<ScopeInfo> info = Constant<ScopeInfo>(0);
   uint32_t slot_count = Uint(1);
@@ -2415,6 +2442,8 @@ void BaselineCompiler::VisitResumeGenerator() {
       generator_object,
       static_cast<int>(RegisterCount(2)));  // register_count
 }
+
+void BaselineCompiler::VisitForOfNext() { UNREACHABLE(); }
 
 void BaselineCompiler::VisitGetIterator() {
   CallBuiltin<Builtin::kGetIteratorBaseline>(RegisterOperand(0),  // receiver

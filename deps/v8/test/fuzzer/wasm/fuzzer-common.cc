@@ -27,6 +27,7 @@
 #include "src/zone/accounting-allocator.h"
 #include "src/zone/zone.h"
 #include "test/common/flag-utils.h"
+#include "test/common/wasm/wasm-macro-gen.h"
 #include "test/common/wasm/wasm-module-runner.h"
 #include "test/fuzzer/fuzzer-support.h"
 #include "tools/wasm/mjsunit-module-disassembler-impl.h"
@@ -59,7 +60,9 @@ void CompileAllFunctionsForReferenceExecution(NativeModule* native_module,
                                       .set_func_index(func.func_index)
                                       .set_for_debugging(kForDebugging)
                                       .set_max_steps(max_steps)
-                                      .set_detect_nondeterminism(true));
+                                      // TODO(clemensb): Fully remove
+                                      // nondeterminism detection.
+                                      .set_detect_nondeterminism(false));
     if (!result.succeeded()) {
       FATAL(
           "Liftoff compilation failed on a valid module. Run with "
@@ -131,35 +134,38 @@ DirectHandle<WasmModuleObject> CompileReferenceModule(
 
 #if V8_ENABLE_DRUMBRAKE
 void ClearJsToWasmWrappersForTesting(Isolate* isolate) {
-  for (int i = 0; i < isolate->heap()->js_to_wasm_wrappers()->length(); i++) {
-    isolate->heap()->js_to_wasm_wrappers()->set(i, ClearedValue(isolate));
-  }
+  isolate->heap()->SetJSToWasmWrappers(
+      ReadOnlyRoots(isolate).empty_weak_fixed_array());
 }
-
-int ExecuteAgainstReference(Isolate* isolate,
-                            DirectHandle<WasmModuleObject> module_object,
-                            int32_t max_executed_instructions,
-                            bool is_wasm_jitless) {
-#else   // V8_ENABLE_DRUMBRAKE
-int ExecuteAgainstReference(Isolate* isolate,
-                            DirectHandle<WasmModuleObject> module_object,
-                            int32_t max_executed_instructions) {
 #endif  // V8_ENABLE_DRUMBRAKE
-  // We do not instantiate the module if there is a start function, because a
-  // start function can contain an infinite loop which we cannot handle.
-  if (module_object->module()->start_function_index >= 0) return -1;
+
+struct ReferenceExecutionResult {
+  int result = -1;
+  std::unique_ptr<const char[]> exception;
+  bool should_execute_non_reference = false;
+};
+
+ReferenceExecutionResult ExecuteReferenceRun(
+    Isolate* isolate, base::Vector<const uint8_t> wire_bytes,
+    int exported_main_function_index, int32_t max_executed_instructions) {
+  // The reference module uses a special compilation mode of Liftoff for
+  // termination and nondeterminism detected, and that would be undone by
+  // flushing that code.
+  FlagScope<bool> no_liftoff_code_flushing(&v8_flags.flush_liftoff_code, false);
 
   int32_t max_steps = max_executed_instructions;
 
   HandleScope handle_scope(isolate);  // Avoid leaking handles.
   Zone reference_module_zone(isolate->allocator(), "wasm reference module");
-  DirectHandle<WasmModuleObject> module_ref = CompileReferenceModule(
-      isolate, module_object->native_module()->wire_bytes(), &max_steps);
+  DirectHandle<WasmModuleObject> module_ref =
+      CompileReferenceModule(isolate, wire_bytes, &max_steps);
   DirectHandle<WasmInstanceObject> instance_ref;
 
   // Before execution, there should be no dangling nondeterminism registered on
-  // the engine.
+  // the engine, no pending exception, and no termination request.
   DCHECK(!WasmEngine::had_nondeterminism());
+  DCHECK(!isolate->has_exception());
+  DCHECK(!isolate->stack_guard()->CheckTerminateExecution());
 
   // Try to instantiate the reference instance, return if it fails.
   {
@@ -170,16 +176,14 @@ int ExecuteAgainstReference(Isolate* isolate,
              .ToHandle(&instance_ref)) {
       isolate->clear_exception();
       thrower.Reset();  // Ignore errors.
-      return -1;
+      return {};
     }
   }
 
-  // Get the "main" exported function. Do nothing if it does not exist.
+  // Get the "main" exported function. We checked before that this exists.
   DirectHandle<WasmExportedFunction> main_function;
-  if (!testing::GetExportedFunction(isolate, instance_ref, "main")
-           .ToHandle(&main_function)) {
-    return -1;
-  }
+  CHECK(testing::GetExportedFunction(isolate, instance_ref, "main")
+            .ToHandle(&main_function));
 
   struct OomCallbackData {
     Isolate* isolate;
@@ -190,27 +194,31 @@ int ExecuteAgainstReference(Isolate* isolate,
   auto heap_limit_callback = [](void* raw_data, size_t current_limit,
                                 size_t initial_limit) -> size_t {
     OomCallbackData* data = reinterpret_cast<OomCallbackData*>(raw_data);
+    if (data->heap_limit_reached) return initial_limit;
     data->heap_limit_reached = true;
-    data->isolate->TerminateExecution();
+    // We can not throw an exception directly at this point, so request
+    // termination on the next stack check.
+    data->isolate->stack_guard()->RequestTerminateExecution();
     data->initial_limit = initial_limit;
-    // Return a slightly raised limit, just to make it to the next
-    // interrupt check point, where execution will terminate.
-    return initial_limit * 1.25;
+    // Return a generously raised limit to maximize the chance to make it to the
+    // next interrupt check point, where execution will terminate.
+    return initial_limit * 4;
   };
   isolate->heap()->AddNearHeapLimitCallback(heap_limit_callback,
                                             &oom_callback_data);
 
   Tagged<WasmExportedFunctionData> func_data =
       main_function->shared()->wasm_exported_function_data();
+  DCHECK_EQ(exported_main_function_index, func_data->function_index());
   const FunctionSig* sig = func_data->instance_data()
                                ->module()
                                ->functions[func_data->function_index()]
                                .sig;
-  auto compiled_args = testing::MakeDefaultArguments(isolate, sig);
-  std::unique_ptr<const char[]> exception_ref;
+  DirectHandleVector<Object> compiled_args =
+      testing::MakeDefaultArguments(isolate, sig);
+  std::unique_ptr<const char[]> exception;
   int32_t result_ref = testing::CallWasmFunctionForTesting(
-      isolate, instance_ref, "main", base::VectorOf(compiled_args),
-      &exception_ref);
+      isolate, instance_ref, "main", base::VectorOf(compiled_args), &exception);
   bool execute = true;
   // Reached max steps, do not try to execute the test module as it might
   // never terminate.
@@ -224,8 +232,62 @@ int ExecuteAgainstReference(Isolate* isolate,
                                                oom_callback_data.initial_limit);
   if (oom_callback_data.heap_limit_reached) {
     execute = false;
-    isolate->CancelTerminateExecution();
+    isolate->stack_guard()->ClearTerminateExecution();
   }
+
+  if (exception) {
+    if (strcmp(exception.get(),
+               "RangeError: Maximum call stack size exceeded") == 0) {
+      // There was a stack overflow, which may happen nondeterministically. We
+      // cannot guarantee the behavior of the test module, and in particular it
+      // may not terminate.
+      execute = false;
+    }
+  }
+
+  if (!execute) {
+    // Before discarding the module, see if Turbofan runs into any DCHECKs.
+    TierUpAllForTesting(isolate, instance_ref->trusted_data(isolate));
+    return {};
+  }
+
+  return {result_ref, std::move(exception), true};
+}
+
+int FindExportedMainFunction(const WasmModule* module,
+                             base::Vector<const uint8_t> wire_bytes) {
+  constexpr base::Vector<const char> kMainName = base::StaticCharVector("main");
+  for (const WasmExport& exp : module->export_table) {
+    if (exp.kind != ImportExportKindCode::kExternalFunction) continue;
+    base::Vector<const uint8_t> name =
+        wire_bytes.SubVector(exp.name.offset(), exp.name.end_offset());
+    if (base::Vector<const char>::cast(name) != kMainName) continue;
+    return exp.index;
+  }
+  return -1;
+}
+
+int ExecuteAgainstReference(Isolate* isolate,
+                            DirectHandle<WasmModuleObject> module_object,
+                            int32_t max_executed_instructions
+#if V8_ENABLE_DRUMBRAKE
+                            ,
+                            bool is_wasm_jitless
+#endif  // V8_ENABLE_DRUMBRAKE
+) {
+  NativeModule* native_module = module_object->native_module();
+  const WasmModule* module = native_module->module();
+  const base::Vector<const uint8_t> wire_bytes = native_module->wire_bytes();
+  int exported_main = FindExportedMainFunction(module, wire_bytes);
+  if (exported_main < 0) return -1;
+
+  // We do not instantiate the module if there is a start function, because a
+  // start function can contain an infinite loop which we cannot handle.
+  if (module->start_function_index >= 0) return -1;
+
+  ReferenceExecutionResult ref_result = ExecuteReferenceRun(
+      isolate, wire_bytes, exported_main, max_executed_instructions);
+  if (!ref_result.should_execute_non_reference) return -1;
 
 #if V8_ENABLE_DRUMBRAKE
   if (is_wasm_jitless) {
@@ -236,7 +298,6 @@ int ExecuteAgainstReference(Isolate* isolate,
     ClearJsToWasmWrappersForTesting(isolate);
 
     // Compiled WasmCode objects should be cleared before running drumbrake.
-    module_ref = Handle<WasmModuleObject>::null();
     isolate->heap()->CollectAllGarbage(GCFlag::kNoFlags,
                                        i::GarbageCollectionReason::kTesting);
 
@@ -251,21 +312,6 @@ int ExecuteAgainstReference(Isolate* isolate,
     if (decoder.DecodeModule(/*validate_functions=*/true).failed()) return -1;
   }
 #endif  // V8_ENABLE_DRUMBRAKE
-
-  if (exception_ref) {
-    if (strcmp(exception_ref.get(),
-               "RangeError: Maximum call stack size exceeded") == 0) {
-      // There was a stack overflow, which may happen nondeterministically. We
-      // cannot guarantee the behavior of the test module, and in particular it
-      // may not terminate.
-      execute = false;
-    }
-  }
-  if (!execute) {
-    // Before discarding the module, see if Turbofan runs into any DCHECKs.
-    TierUpAllForTesting(isolate, instance_ref->trusted_data(isolate));
-    return -1;
-  }
 
   // Instantiate a fresh instance for the actual (non-ref) execution.
   DirectHandle<WasmInstanceObject> instance;
@@ -291,6 +337,9 @@ int ExecuteAgainstReference(Isolate* isolate,
   }
 
   std::unique_ptr<const char[]> exception;
+  const FunctionSig* sig = module->functions[exported_main].sig;
+  DirectHandleVector<Object> compiled_args =
+      testing::MakeDefaultArguments(isolate, sig);
   int32_t result = testing::CallWasmFunctionForTesting(
       isolate, instance, "main", base::VectorOf(compiled_args), &exception);
 
@@ -300,14 +349,14 @@ int ExecuteAgainstReference(Isolate* isolate,
   // terminate. If this happens often enough we should do something about this.
   if (WasmEngine::clear_nondeterminism()) return -1;
 
-  if ((exception_ref != nullptr) != (exception != nullptr)) {
+  if ((ref_result.exception != nullptr) != (exception != nullptr)) {
     FATAL("Exception mismatch! Expected: <%s>; got: <%s>",
-          exception_ref ? exception_ref.get() : "<no exception>",
+          ref_result.exception ? ref_result.exception.get() : "<no exception>",
           exception ? exception.get() : "<no exception>");
   }
 
   if (!exception) {
-    CHECK_EQ(result_ref, result);
+    CHECK_EQ(ref_result.result, result);
   }
 
   return 0;
@@ -353,36 +402,27 @@ void GenerateTestCase(StdoutStream& os, Isolate* isolate,
 }
 
 namespace {
-std::vector<uint8_t> CreateDummyModuleWireBytes(Zone* zone) {
-  // Build a simple module with a few types to pre-populate the type
-  // canonicalizer.
-  WasmModuleBuilder builder(zone);
-  const bool is_final = true;
-  builder.AddRecursiveTypeGroup(0, 2);
-  builder.AddArrayType(zone->New<ArrayType>(kWasmF32, true), is_final);
-  StructType::Builder struct_builder(zone, 2, false);
-  struct_builder.AddField(kWasmI64, false);
-  struct_builder.AddField(kWasmExternRef, false);
-  builder.AddStructType(struct_builder.Build(), !is_final);
-  FunctionSig::Builder sig_builder(zone, 1, 0);
-  sig_builder.AddReturn(kWasmI32);
-  builder.AddSignature(sig_builder.Get(), is_final);
-  ZoneBuffer buffer{zone};
-  builder.WriteTo(&buffer);
-  return std::vector<uint8_t>(buffer.begin(), buffer.end());
-}
+static uint8_t kDummyModuleWireBytes[]{
+    WASM_MODULE_HEADER,
+    SECTION(Type, ENTRY_COUNT(2),
+            // recgroup of 2 types
+            WASM_REC_GROUP(ENTRY_COUNT(2),
+                           // (array (field (mut f32)))
+                           WASM_ARRAY_DEF(kF32Code, true),
+                           // (struct (field i64) (field externref))
+                           WASM_NONFINAL(WASM_STRUCT_DEF(
+                               FIELD_COUNT(2), STRUCT_FIELD(kI64Code, false),
+                               STRUCT_FIELD(kExternRefCode, false)))),
+            // function type (void -> i32)
+            SIG_ENTRY_x(kI32Code))};
+
 }  // namespace
 
-void AddDummyTypesToTypeCanonicalizer(Isolate* isolate, Zone* zone) {
+void AddDummyTypesToTypeCanonicalizer(Isolate* isolate) {
   const size_t type_count = GetTypeCanonicalizer()->GetCurrentNumberOfTypes();
-  testing::SetupIsolateForWasmModule(isolate);
-  // Cache (and leak) the wire bytes, so they don't need to be rebuilt on each
-  // run.
-  static const std::vector<uint8_t> wire_bytes =
-      CreateDummyModuleWireBytes(zone);
   const bool is_valid = GetWasmEngine()->SyncValidate(
       isolate, WasmEnabledFeatures(), CompileTimeImportsForFuzzing(),
-      base::VectorOf(wire_bytes));
+      base::VectorOf(kDummyModuleWireBytes));
   CHECK(is_valid);
   // As the types are reset on each run by the fuzzer, the validation should
   // have added new types to the TypeCanonicalizer.
@@ -391,12 +431,15 @@ void AddDummyTypesToTypeCanonicalizer(Isolate* isolate, Zone* zone) {
 
 void EnableExperimentalWasmFeatures(v8::Isolate* isolate) {
   struct EnableExperimentalWasmFeatures {
-    explicit EnableExperimentalWasmFeatures(v8::Isolate* isolate) {
+    explicit EnableExperimentalWasmFeatures(v8::Isolate* isolate)
+        : isolate(isolate) {
       // Enable all staged features.
-#define ENABLE_STAGED_FEATURES(feat, ...) \
+#define ENABLE_PRE_STAGED_AND_STAGED_FEATURES(feat, ...) \
   v8_flags.experimental_wasm_##feat = true;
-      FOREACH_WASM_STAGING_FEATURE_FLAG(ENABLE_STAGED_FEATURES)
-#undef ENABLE_STAGED_FEATURES
+      FOREACH_WASM_PRE_STAGING_FEATURE_FLAG(
+          ENABLE_PRE_STAGED_AND_STAGED_FEATURES)
+      FOREACH_WASM_STAGING_FEATURE_FLAG(ENABLE_PRE_STAGED_AND_STAGED_FEATURES)
+#undef ENABLE_PRE_STAGED_AND_STAGED_FEATURES
 
       // Enable non-staged experimental features or other experimental flags
       // that we also want to fuzz, e.g., new optimizations.
@@ -407,8 +450,14 @@ void EnableExperimentalWasmFeatures(v8::Isolate* isolate) {
       // `PrintModule()` of `mjsunit-module-disassembler-impl.h`, to make bugs
       // easier to reproduce with generated mjsunit test cases.
 
-      // See https://crbug.com/335082212.
-      v8_flags.wasm_inlining_call_indirect = true;
+      // The "pure Wasm" part of this proposal is considered ready for
+      // fuzzing, the JS-related part (prototypes etc) not yet.
+      v8_flags.experimental_wasm_custom_descriptors = true;
+
+#ifdef V8_ENABLE_WASM_SIMD256_REVEC
+      // Fuzz revectorization, which is otherwise still considered experimental.
+      v8_flags.experimental_wasm_revectorize = true;
+#endif  // V8_ENABLE_WASM_SIMD256_REVEC
 
       // Enforce implications from enabling features.
       FlagList::EnforceFlagImplications();
@@ -417,13 +466,20 @@ void EnableExperimentalWasmFeatures(v8::Isolate* isolate) {
       // implicitly.
       isolate->InstallConditionalFeatures(isolate->GetCurrentContext());
     }
+
+    const v8::Isolate* const isolate;
   };
-  // The compiler will properly synchronize the constructor call.
+
+  // Call the constructor exactly once (per process!). The compiler will
+  // properly synchronize this.
   static EnableExperimentalWasmFeatures one_time_enable_experimental_features(
       isolate);
+  // Ensure that within the same process we always pass the same isolate. You
+  // would get surprising results otherwise.
+  CHECK_EQ(one_time_enable_experimental_features.isolate, isolate);
 }
 
-void ResetTypeCanonicalizer(v8::Isolate* isolate, Zone* zone) {
+void ResetTypeCanonicalizer(v8::Isolate* isolate) {
   v8::internal::Isolate* i_isolate =
       reinterpret_cast<v8::internal::Isolate*>(isolate);
 
@@ -439,7 +495,7 @@ void ResetTypeCanonicalizer(v8::Isolate* isolate, Zone* zone) {
   }
   GetTypeCanonicalizer()->EmptyStorageForTesting();
   TypeCanonicalizer::ClearWasmCanonicalTypesForTesting(i_isolate);
-  AddDummyTypesToTypeCanonicalizer(i_isolate, zone);
+  AddDummyTypesToTypeCanonicalizer(i_isolate);
 }
 
 int WasmExecutionFuzzer::FuzzWasmModule(base::Vector<const uint8_t> data,
@@ -471,21 +527,6 @@ int WasmExecutionFuzzer::FuzzWasmModule(base::Vector<const uint8_t> data,
   AccountingAllocator allocator;
   Zone zone(&allocator, ZONE_NAME);
 
-  // Clear recursive groups: The fuzzer creates random types in every run. These
-  // are saved as recursive groups as part of the type canonicalizer, but types
-  // from previous runs just waste memory.
-  ResetTypeCanonicalizer(isolate, &zone);
-
-  // Clear any exceptions from a prior run.
-  if (i_isolate->has_exception()) {
-    i_isolate->clear_exception();
-  }
-
-  v8::TryCatch try_catch(isolate);
-  HandleScope scope(i_isolate);
-
-  ZoneBuffer buffer(&zone);
-
   // The first byte specifies some internal configuration, like which function
   // is compiled with which compiler, and other flags.
   uint8_t configuration_byte = data.empty() ? 0 : data[0];
@@ -503,23 +544,46 @@ int WasmExecutionFuzzer::FuzzWasmModule(base::Vector<const uint8_t> data,
     tier_mask |= (compiler_config == 0) << i;
     debug_mask |= (compiler_config == 2) << i;
   }
+  // The purpose of setting the tier mask (which affects the initial
+  // compilation of each function) is to deterministically test a combination
+  // of Liftoff and Turbofan.
+  FlagScope<int> tier_mask_scope(&v8_flags.wasm_tier_mask_for_testing,
+                                 tier_mask);
+  FlagScope<int> debug_mask_scope(&v8_flags.wasm_debug_mask_for_testing,
+                                  debug_mask);
 
+  ZoneBuffer buffer(&zone);
   if (!GenerateModule(i_isolate, &zone, data, &buffer)) {
     return -1;
   }
 
-  testing::SetupIsolateForWasmModule(i_isolate);
+  return SyncCompileAndExecuteAgainstReference(isolate, base::VectorOf(buffer),
+                                               require_valid);
+}
 
-  ModuleWireBytes wire_bytes(buffer.begin(), buffer.end());
+int SyncCompileAndExecuteAgainstReference(
+    v8::Isolate* isolate, base::Vector<const uint8_t> wire_bytes,
+    bool require_valid) {
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
+
+  // Clear recursive groups: The fuzzer creates random types in every run. These
+  // are saved as recursive groups as part of the type canonicalizer, but types
+  // from previous runs just waste memory.
+  ResetTypeCanonicalizer(isolate);
+
+  // Clear any exceptions from a prior run.
+  if (i_isolate->has_exception()) i_isolate->clear_exception();
+
+  v8::TryCatch try_catch(isolate);
+  HandleScope scope(i_isolate);
 
   auto enabled_features = WasmEnabledFeatures::FromIsolate(i_isolate);
 
-  bool valid = GetWasmEngine()->SyncValidate(i_isolate, enabled_features,
-                                             CompileTimeImportsForFuzzing(),
-                                             wire_bytes.module_bytes());
+  bool valid = GetWasmEngine()->SyncValidate(
+      i_isolate, enabled_features, CompileTimeImportsForFuzzing(), wire_bytes);
 
   if (v8_flags.wasm_fuzzer_gen_test) {
-    GenerateTestCase(i_isolate, wire_bytes, valid);
+    GenerateTestCase(i_isolate, ModuleWireBytes{wire_bytes}, valid);
   }
 
   FlagScope<bool> eager_compile(&v8_flags.wasm_lazy_compilation, false);
@@ -528,23 +592,15 @@ int WasmExecutionFuzzer::FuzzWasmModule(base::Vector<const uint8_t> data,
   // around inlining). We switch it to synchronous mode to avoid the
   // nondeterminism of background jobs finishing at random times.
   FlagScope<bool> sync_tier_up(&v8_flags.wasm_sync_tier_up, true);
-  // The purpose of setting the tier mask (which affects the initial
-  // compilation of each function) is to deterministically test a combination
-  // of Liftoff and Turbofan.
-  FlagScope<int> tier_mask_scope(&v8_flags.wasm_tier_mask_for_testing,
-                                 tier_mask);
-  FlagScope<int> debug_mask_scope(&v8_flags.wasm_debug_mask_for_testing,
-                                  debug_mask);
   // Reference runs use extra compile settings (like non-determinism detection),
-  // which would be removed and replaced with a new liftoff function without
-  // these options.
+  // which could be replaced by new liftoff code without this option.
   FlagScope<bool> no_liftoff_code_flushing(&v8_flags.flush_liftoff_code, false);
 
   ErrorThrower thrower(i_isolate, "WasmFuzzerSyncCompile");
   MaybeDirectHandle<WasmModuleObject> compiled_module =
       GetWasmEngine()->SyncCompile(i_isolate, enabled_features,
                                    CompileTimeImportsForFuzzing(), &thrower,
-                                   base::OwnedCopyOf(buffer));
+                                   base::OwnedCopyOf(wire_bytes));
   CHECK_EQ(valid, !compiled_module.is_null());
   CHECK_EQ(!valid, thrower.error());
   if (require_valid && !valid) {

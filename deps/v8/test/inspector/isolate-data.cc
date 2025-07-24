@@ -39,7 +39,7 @@ class Inspectable : public v8_inspector::V8InspectorSession::Inspectable {
       : object_(isolate, object) {}
   ~Inspectable() override = default;
   v8::Local<v8::Value> get(v8::Local<v8::Context> context) override {
-    return object_.Get(context->GetIsolate());
+    return object_.Get(v8::Isolate::GetCurrent());
   }
 
  private:
@@ -235,7 +235,11 @@ std::vector<uint8_t> InspectorIsolateData::DisconnectSession(
     int session_id, TaskRunner* context_task_runner) {
   v8::SealHandleScope seal_handle_scope(isolate());
   auto it = sessions_.find(session_id);
-  CHECK(it != sessions_.end());
+  if (it == sessions_.end()) {
+    CHECK(v8_flags.fuzzing);
+    return {};
+  }
+
   context_group_by_session_.erase(it->second.get());
   std::vector<uint8_t> result = it->second->state();
   sessions_.erase(it);
@@ -353,7 +357,7 @@ void InspectorIsolateData::DumpAsyncTaskStacksStateForTest() {
 // static
 int InspectorIsolateData::HandleMessage(v8::Local<v8::Message> message,
                                         v8::Local<v8::Value> exception) {
-  v8::Isolate* isolate = message->GetIsolate();
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
   v8::Local<v8::Context> context = isolate->GetEnteredOrMicrotaskContext();
   if (context.IsEmpty()) return 0;
   v8_inspector::V8Inspector* inspector =
@@ -395,7 +399,7 @@ void InspectorIsolateData::MessageHandler(v8::Local<v8::Message> message,
 
 // static
 void InspectorIsolateData::PromiseRejectHandler(v8::PromiseRejectMessage data) {
-  v8::Isolate* isolate = data.GetPromise()->GetIsolate();
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
   v8::Local<v8::Context> context = isolate->GetEnteredOrMicrotaskContext();
   if (context.IsEmpty()) return;
   v8::Local<v8::Promise> promise = data.GetPromise();
@@ -542,7 +546,7 @@ void InspectorIsolateData::quitMessageLoopOnPause() {
 void InspectorIsolateData::installAdditionalCommandLineAPI(
     v8::Local<v8::Context> context, v8::Local<v8::Object> object) {
   if (additional_console_api_.IsEmpty()) return;
-  CHECK(context->GetIsolate() == isolate());
+  CHECK_EQ(v8::Isolate::GetCurrent(), isolate());
   v8::HandleScope handle_scope(isolate());
   v8::Context::Scope context_scope(context);
   v8::ScriptOrigin origin(
